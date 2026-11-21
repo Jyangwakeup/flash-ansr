@@ -112,6 +112,47 @@ def report(cfg: Any, out: Any) -> None:
     if len(pool_cost) == 2:
         lines += ["", f"随机池耗时是模型池的 {pool_cost['random'] / pool_cost['model']:.0%}。两个池同时建、"
                   "和其他任务抢 CPU，比例只作参考。"]
+    # full pipeline (规则 §2.3): the model alone does both stages; added after the final results
+    self_names = {
+        "self_C_two": "C 自己两阶段（300 + 看自己的历史 700）",
+        "self_C_direct": "C 直接生成 1000 个",
+        "self_B_two": "B 自己两阶段",
+        "self_B_direct": "B 直接生成 1000 个",
+        "self_A_direct": "A 直接生成 1000 个",
+        "self_T8_direct": "原 T8 直接生成 1000 个（与 A/B/C 同一套推理代码）",
+    }
+    self_data = {n: load(out, n) for n in self_names}
+    if any(v is not None for v in self_data.values()):
+        lines += ["", "## 完整流程评测（模型自己完成两阶段；看到上面结果后加入，规则 2.3）", "",
+                  "| 条件 | 题数 | vNRR | fNRR | Oracle（留出点） | 第二阶段新解出（第一阶段未解出的题中） |",
+                  "|---|---:|---:|---:|---:|---:|"]
+        for n, label in self_names.items():
+            rows = self_data[n]
+            if rows is None:
+                lines.append(f"| {label} | — | 未完成 | | | |")
+                continue
+            new = "不适用"
+            if rows[0].get("phase1"):
+                un = [r for r in rows if not r["phase0"]["oracle_val"]]
+                new = f"{sum(r['phase1']['oracle_val'] for r in un)}/{len(un)}"
+            lines.append(f"| {label} | {len(rows)} | {rate(rows, 'merged', 'top1_val'):.1%} | "
+                         f"{rate(rows, 'merged', 'top1_fit'):.1%} | {rate(rows, 'merged', 'oracle_val'):.1%} | {new} |")
+        lines += ["", "| 比较 | 题数 | vNRR 差值 | 95% 置信区间 |", "|---|---:|---:|---|"]
+        all_rows = {**self_data, "original_T8": data.get("original_T8")}
+        for a_, b_, label in [
+            ("self_C_two", "self_C_direct", "C：自己两阶段 vs 直接生成（精修本身有没有用）"),
+            ("self_B_two", "self_B_direct", "B：自己两阶段 vs 直接生成"),
+            ("self_C_two", "self_A_direct", "C 整套方案 vs A 直接生成"),
+            ("self_B_two", "self_A_direct", "B 整套方案 vs A 直接生成"),
+            ("self_C_two", "self_T8_direct", "C 整套方案 vs 原 T8（同一套推理代码）"),
+            ("self_A_direct", "self_T8_direct", "A vs 原 T8（同一套推理代码）：训练后模型是否变弱"),
+            ("self_T8_direct", "original_T8", "原 T8：手写推理代码 vs 作者 fit 流程（代码差异）"),
+        ]:
+            if all_rows.get(a_) is None or all_rows.get(b_) is None:
+                lines.append(f"| {label} | — | 未完成 | |")
+                continue
+            c = paired(solved(all_rows[a_]), solved(all_rows[b_]), train_seed(cfg))
+            lines.append(f"| {label} | {c['n']} | {c['diff']:+.1%} | [{c['lo']:+.1%}, {c['hi']:+.1%}] |")
     budget = out / "equal_time_budget.json"
     if budget.exists():
         b = json.loads(budget.read_text())

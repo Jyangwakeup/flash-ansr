@@ -13,6 +13,8 @@ Stages (independent ones may run as parallel processes):
     step0-eval                             step-0, no history, 1,000 draws (transfer control)
     equal-time-measure                     time one sample of each method -- run ALONE (timing)
     equal-time --condition NAME|original_T8  rerun at the time-matched budget (parallel is fine)
+    self --condition NAME                  full pipeline, the model alone (规则 §2.3): NAME in
+                                           SELF_CONDITIONS (added after the final results)
     report                                 tables and the medium-scale report
 
 Timing caveat: stages that run in parallel contend for the CPU, so their seconds are only
@@ -35,6 +37,13 @@ from pool import build
 
 CONFIG = "experimental/history_benefits/medium.yaml"
 GROUP_SOURCE = {"A": "model", "B": "random", "C": "model"}  # A never uses its pool
+#: full-pipeline conditions: name -> (model, two_stage). "T8" is the frozen original model run
+#: through the same hand-written inference code as A/B/C.
+SELF_CONDITIONS = {
+    "self_C_two": ("C", True), "self_C_direct": ("C", False),
+    "self_B_two": ("B", True), "self_B_direct": ("B", False),
+    "self_A_direct": ("A", False), "self_T8_direct": ("T8", False),
+}
 
 
 def provenance(cfg: Any, out: Any, stage: Any) -> None:
@@ -100,7 +109,7 @@ def main() -> Any:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["pools-train", "pools-validation", "step0", "train",
                                           "cooldown", "probe-main", "final", "original",
-                                          "step0-eval", "equal-time-measure", "equal-time", "report"])
+                                          "step0-eval", "equal-time-measure", "equal-time", "self", "report"])
     parser.add_argument("--group", choices=["A", "B", "C"])
     parser.add_argument("--condition")
     parser.add_argument("--config", default=CONFIG)
@@ -276,6 +285,17 @@ def main() -> Any:
         n = budget["phase1_draws"][name]
         run_rows(f"equal_time_{name}", lambda ids, log: run_condition(
             cfg, out, m, ids, hist, n, phase0=True, log=log))
+        return
+    if args.stage == "self":
+        from medium_eval import run_self
+
+        who, two = SELF_CONDITIONS[args.condition]
+        if who == "T8":
+            base = load_base(cfg)
+            model = base.flash_ansr_model
+        else:
+            model = load_checkpoint(m, out / "cooldown" / who / f"checkpoint_{cfg['steps']}.pt")
+        run_rows(args.condition, lambda ids, log: run_self(cfg, out, model, ids, two, log=log))
         return
     if args.stage == "report":
         from medium_report import report
