@@ -136,7 +136,12 @@ def generate(cfg: Any, model: Any, wrapper: Any, problem: Any, pid: Any, history
 
 def outcome(candidates: Any) -> dict:
     """fNRR / vNRR of the score-ranked first candidate, and the held-out Oracle."""
-    ranked = sorted(candidates, key=lambda r: r["score"] if r["score"] == r["score"] else float("inf"))
+    def key(r: Any) -> float:
+        # a missing score (NaN, stored as null by dump) ranks last, as in the shipped ranking
+        s = r.get("score")
+        return float("inf") if s is None or s != s else float(s)
+
+    ranked = sorted(candidates, key=key)
     top = ranked[0] if ranked else None
     return dict(
         n_candidates=len(candidates),
