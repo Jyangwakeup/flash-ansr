@@ -1,0 +1,38 @@
+version: 1
+model: models/psaegert/flash-ansr-v25.0-T8-3M
+recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
+train_recipe: configs/v25.0-T8.1-3M/train.yaml
+output: runs/history_benefits/medium
+# seed: the shared step-0 initialization only; every other stream has its own seed below.
+seed: 20261120
+data_seed_train: 20261121
+data_seed_validation: 20261122
+train_seed: 20261123
+fit_seed: 20261124
+eval_seed: 20261125
+threads: 4
+workers: 4
+train_problems: 1000
+validation_problems: 200
+draws: 300
+restarts: 8
+keep: null
+history_top: 10
+max_length: 256
+generation_tokens: 128
+batch_size: 128
+micro_batch: 8
+steps: 1000
+warmup: 100
+checkpoint_every: 200
+cooldown_from: 800
+probe_draws: 20
+phase0_draws: 300
+phase1_draws: 700
+baseline_draws: 1000
+# Validation (= evaluation) problems follow the author's latest evaluation protocol (srbf 0.11.1
+# suite template): same catalog as training, noiseless, 512 support + 512 held-out points.
+validation_sampling:
+  n_support: 512
+  n_validation: 512
+  noise: 0.0
