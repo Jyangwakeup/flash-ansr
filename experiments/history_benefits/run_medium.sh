@@ -19,7 +19,7 @@ SESSION="${SESSION:-history}"
 if [[ "${1:-}" == "start" ]]; then
   mkdir -p "$LOGS"
   tmux new-session -d -s "$SESSION" -n pipeline -c "$ROOT" \
-    "CONFIG=$CONFIG $0 run 2>&1 | tee -a $LOGS/pipeline.log; echo 'pipeline finished'; exec bash"
+    "CONFIG=$CONFIG caffeinate -ims $0 run 2>&1 | tee -a $LOGS/pipeline.log; echo 'pipeline finished'; exec bash"
   tmux new-window -t "$SESSION" -n logs -c "$LOGS" \
     "sleep 2; tail -n 3 -F $LOGS/*.log $ROOT/runs/medium_pools_*.log 2>/dev/null"
   tmux new-window -t "$SESSION" -n shell -c "$ROOT"
