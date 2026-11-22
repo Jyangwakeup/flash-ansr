@@ -1,8 +1,39 @@
 import datetime
 import argparse
+import netrc
+import os
 import sys
 
 from collections.abc import Sequence
+
+
+DEFAULT_WANDB_PROJECT = 'flash-ansr'
+DEFAULT_WANDB_ENTITY = 'julieyang-heidelberg-university'
+
+
+def _wandb_logged_in() -> bool:
+    """True when a W&B API key is available (env var, or ~/.netrc for the configured server)."""
+    if os.environ.get('WANDB_API_KEY'):
+        return True
+    from urllib.parse import urlparse
+    hosts = {'api.wandb.ai', urlparse(os.environ.get('WANDB_BASE_URL', '')).hostname or ''}
+    try:
+        import wandb
+        hosts.add(urlparse(wandb.Settings().base_url).hostname or '')
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        auth = netrc.netrc()
+    except (FileNotFoundError, netrc.NetrcParseError, OSError):
+        return False
+    return any(h and auth.authenticators(h) is not None for h in hosts)
+
+
+def _resolve_wandb_mode(mode: str) -> str:
+    """'auto' -> $WANDB_MODE if set, else 'online' when logged in, else 'offline' (sync later)."""
+    if mode != 'auto':
+        return mode
+    return os.environ.get('WANDB_MODE') or ('online' if _wandb_logged_in() else 'offline')
 
 
 def _wandb_timestamp_to_local(timestamp: str) -> datetime.datetime:
@@ -27,16 +58,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     train_parser.add_argument('-vi', '--validate-interval', type=int, default=None, help='Interval for validating the model')
     train_parser.add_argument('-w', '--num_workers', type=int, default=None, help='Number of worker processes for data generation')
     train_parser.add_argument('-vw', '--validate_num_workers', type=int, default=None, help='Worker count for the validation pool (kept alive next to the training pool; default: num_workers)')
-    train_parser.add_argument('--project', type=str, default='neural-symbolic-regression', help='Name of the wandb project')
-    train_parser.add_argument('--entity', type=str, default='psaegert', help='Name of the wandb entity')
+    train_parser.add_argument('--project', type=str, default=os.environ.get('WANDB_PROJECT', DEFAULT_WANDB_PROJECT), help='Name of the wandb project (default: $WANDB_PROJECT or flash-ansr)')
+    train_parser.add_argument('--entity', type=str, default=os.environ.get('WANDB_ENTITY', DEFAULT_WANDB_ENTITY), help='Name of the wandb entity (default: $WANDB_ENTITY or the fork owner)')
     train_parser.add_argument('--name', type=str, default=None, help='Name of the wandb run')
-    train_parser.add_argument('--mode', type=str, default='disabled', help="Mode for wandb logging ('online', 'offline', or 'disabled'; default disabled — pass --mode online to log)")
+    train_parser.add_argument('--mode', type=str, default='auto', help="Mode for wandb logging ('auto', 'online', 'offline', or 'disabled'; default auto = $WANDB_MODE if set, else online when logged in, else offline)")
     train_parser.add_argument('--resume-from', type=str, default=None, help='Path to a checkpoint directory to resume from')
     train_parser.add_argument('--resume-step', type=int, default=None, help='Override the inferred resume step when resuming')
 
     wandb_stats_parser = subparsers.add_parser("wandb-stats")
-    wandb_stats_parser.add_argument('--project', type=str, default='neural-symbolic-regression', help='Name of the wandb project')
-    wandb_stats_parser.add_argument('--entity', type=str, default='psaegert', help='Name of the wandb entity')
+    wandb_stats_parser.add_argument('--project', type=str, default=os.environ.get('WANDB_PROJECT', DEFAULT_WANDB_PROJECT), help='Name of the wandb project')
+    wandb_stats_parser.add_argument('--entity', type=str, default=os.environ.get('WANDB_ENTITY', DEFAULT_WANDB_ENTITY), help='Name of the wandb entity')
     wandb_stats_parser.add_argument('-o', '--output-file', type=str, default='wandb_stats.csv', help='Path to the output file')
 
     benchmark_parser = subparsers.add_parser("benchmark")
@@ -104,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     validate_batch_size=config.get('val_batch_size', None),
                     wandb_watch_log=config.get('wandb_watch_log', None),
                     wandb_watch_log_freq=config.get('wandb_watch_log_freq', 1000),
-                    wandb_mode=args.mode,
+                    wandb_mode=_resolve_wandb_mode(args.mode),
                     num_workers=args.num_workers,
                     validate_num_workers=args.validate_num_workers,
                     resume_from=args.resume_from,
@@ -128,7 +159,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         case 'wandb-stats':
             print(f'Fetching stats from wandb project {args.project} and entity {args.entity}')
-            import os
             import wandb
             import pandas as pd
 
