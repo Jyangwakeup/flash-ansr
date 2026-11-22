@@ -155,19 +155,19 @@ def report(cfg: Any, out: Any) -> None:
             lines.append(f"| {label} | {c['n']} | {c['diff']:+.1%} | [{c['lo']:+.1%}, {c['hi']:+.1%}] |")
     budget = out / "equal_time_budget.json"
     if budget.exists():
-        b = json.loads(budget.read_text())
+        bud = json.loads(budget.read_text())
         lines += ["", "## 同时间对比", "",
-                  f"每题时间预算 {b['budget_seconds_per_problem']:.1f} 秒（原 T8 生成 1000 个的中位数，"
-                  f"单独测量）；第一阶段 {b['phase0_seconds_per_problem']:.1f} 秒。", "",
+                  f"每题时间预算 {bud['budget_seconds_per_problem']:.1f} 秒（原 T8 生成 1000 个的中位数，"
+                  f"单独测量）；第一阶段 {bud['phase0_seconds_per_problem']:.1f} 秒。", "",
                   "| 条件 | 第二阶段生成数 | vNRR | 与原 T8 的差（95% CI） |", "|---|---:|---:|---|"]
         base = load(out, "equal_time_original_T8") or data.get("original_T8")
         for n in CONDITIONS:
             rows = load(out, f"equal_time_{n}")
             if rows is None or base is None:
-                lines.append(f"| {LABELS[n]} | {b['phase1_draws'][n]} | 未完成 | |")
+                lines.append(f"| {LABELS[n]} | {bud['phase1_draws'][n]} | 未完成 | |")
                 continue
             c = paired(solved(rows), solved(base), train_seed(cfg))
-            lines.append(f"| {LABELS[n]} | {b['phase1_draws'][n]} | {rate(rows, 'merged', 'top1_val'):.1%} | "
+            lines.append(f"| {LABELS[n]} | {bud['phase1_draws'][n]} | {rate(rows, 'merged', 'top1_val'):.1%} | "
                          f"{c['diff']:+.1%} [{c['lo']:+.1%}, {c['hi']:+.1%}] |")
     else:
         lines += ["", "## 同时间对比", "", "未完成。在此之前，结论只能写成「生成次数相同时」。"]

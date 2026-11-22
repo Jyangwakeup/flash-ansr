@@ -96,7 +96,7 @@ def probe(cfg: Any, out: Any, m: Any, group: Any, folder: Any, step: Any) -> Non
     if path.exists():
         return
     _, val = ids_of(cfg)
-    sources = [None] if group == "A" else [None, GROUP_SOURCE[group]]
+    sources: list[str | None] = [None] if group == "A" else [None, GROUP_SOURCE[group]]
     result = {}
     for src in sources:
         rows = run_condition(cfg, out, m, val, src, cfg["probe_draws"], phase0=False)
@@ -220,7 +220,7 @@ def main() -> Any:
         if done.exists():
             return
         log = final / f"{name}.jsonl"
-        seen = [json.loads(l) for l in log.open()] if log.exists() else []
+        seen = [json.loads(line) for line in log.open()] if log.exists() else []
         finished = {r["pid"] for r in seen}
         rows_ids = [p for p in val_ids if p not in finished]
         from wb import Run
@@ -238,7 +238,7 @@ def main() -> Any:
 
         try:
             fn(rows_ids, logged)
-            rows = [json.loads(l) for l in log.open()]
+            rows = [json.loads(line) for line in log.open()]
             summary = summarize(rows)
             dump(done, dict(name=name, summary=summary, rows=rows))
             run.summary(summary | ({"phase1": summarize(rows, "phase1")} if rows and rows[0].get("phase1") else {}))

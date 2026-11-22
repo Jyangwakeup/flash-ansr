@@ -15,6 +15,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -57,7 +58,7 @@ def load_step0() -> FlashANSRModel:
     return m
 
 
-def evaluate_no_history(cfg, out, model, ids, label):
+def evaluate_no_history(cfg: Any, out: Path, model: Any, ids: Any, label: str) -> Any:
     """evaluate.py 中 K=0（不给历史）那条路的逐行复制。
 
     唯一区别：模型没有历史位置时（原 T8），只传 (x, y) 两部分数据，不传 history_mask。
@@ -161,7 +162,7 @@ def evaluate_no_history(cfg, out, model, ids, label):
     return rows
 
 
-def self_check(cfg, out, ids):
+def self_check(cfg: Any, out: Path, ids: Any) -> Any:
     """复制版和原版 evaluate 各测一次 step-0，可用公式必须完全一样。"""
     original = evaluate(cfg, out, load_step0(), "A", ids, "selfcheck")
     copied = evaluate_no_history(cfg, out, load_step0(), ids, "selfcheck_copy")
@@ -178,7 +179,7 @@ def self_check(cfg, out, ids):
 
 # ---------------- 汇总 ----------------
 
-def per_problem(row):
+def per_problem(row: dict) -> dict:
     fvus = [c["fvu"] for c in row["candidates"] if c["fvu"] is not None and np.isfinite(c["fvu"])]
     ranked = sorted(
         (c for c in row["candidates"] if c["score"] is not None), key=lambda c: c["score"]
@@ -189,7 +190,7 @@ def per_problem(row):
                 extraction_failures=len(row.get("extraction_failures", [])))
 
 
-def stats(problems):
+def stats(problems: Any) -> dict:
     out = dict(
         problems=len(problems),
         failed=sum(p["n"] == 0 for p in problems),
@@ -202,7 +203,7 @@ def stats(problems):
     return out
 
 
-def paired(a, b, name_a, name_b, seed=0):
+def paired(a: Any, b: Any, name_a: str, name_b: str, seed: int = 0) -> dict:
     """同题比较最佳误差：log10 相差超过 0.1（约 25%）才算一方更好；两边都 <1e-6 算打平。"""
     a = {p["pid"]: p for p in a}
     b = {p["pid"]: p for p in b}
@@ -227,7 +228,7 @@ def paired(a, b, name_a, name_b, seed=0):
     )
 
 
-def summarize(ids):
+def summarize(ids: Any) -> Any:
     load = lambda p: json.loads(Path(p).read_text())  # noqa: E731
     pick = lambda rows, k=None: [per_problem(r) for r in rows if r["pid"] in ids and (k is None or r["requested_history"] == k)]  # noqa: E731
     models = {
@@ -264,7 +265,7 @@ def summarize(ids):
     print(json.dumps({k: summary[k] for k in ("models", "paired", "history")}, ensure_ascii=False, indent=1))
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=["smoke", "full", "summarize"])
     args = parser.parse_args()

@@ -21,6 +21,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,7 +41,7 @@ DEFAULT_GRID = {50: 1, 100: 1, 300: 1, 1000: 1, 3000: 1}   # N -> number of fit 
 
 
 # ----------------------------------------------------------------------------- compute accounting
-def decoder_flops_per_token(model, context_len: float) -> float:
+def decoder_flops_per_token(model: Any, context_len: float) -> float:
     """Forward FLOPs of ONE decoded token: 2*P_dec (matmuls) + attention scores/values.
 
     context_len = tokens already in the decoder sequence (prefix + generated so far, averaged).
@@ -55,7 +56,7 @@ def decoder_flops_per_token(model, context_len: float) -> float:
     return 2.0 * p_dec + layers * 4.0 * d * (context_len + s_mem)
 
 
-def encoder_flops(model, n_points: int) -> float:
+def encoder_flops(model: Any, n_points: int) -> float:
     """One encoder forward over the support set: ~2*P_enc FLOPs per point (ISAB keeps it linear in n)."""
     core = model.flash_ansr_model
     p_enc = sum(p.numel() for p in core.encoder.parameters())
@@ -63,7 +64,7 @@ def encoder_flops(model, n_points: int) -> float:
 
 
 # ----------------------------------------------------------------------------- one problem
-def evaluate(model, sample, draws: int, seed: int) -> dict:
+def evaluate(model: Any, sample: Any, draws: int, seed: int) -> dict:
     y_fit = sample.y_support
     x_val, y_val = sample.x_validation, np.asarray(sample.y_validation, dtype=np.float64).reshape(-1)
     names = sample.metadata.get("variable_names")
@@ -131,7 +132,7 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
-    solved = defaultdict(lambda: {"oracle": [], "top1": []})   # N -> per-row outcomes (incl. earlier rows)
+    solved: defaultdict[int, dict[str, list]] = defaultdict(lambda: {"oracle": [], "top1": []})   # N -> per-row outcomes (incl. earlier rows)
     if out.exists():
         for line in out.read_text().splitlines():
             r = json.loads(line)

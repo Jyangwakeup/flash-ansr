@@ -24,7 +24,7 @@ def draw_problems(cfg: Any, split: Any, count: Any) -> Any:
     """The first ``count`` real problems of one split's seeded stream, in order."""
     src, _ = source(cfg, split)
     iterator = iter(src)
-    problems = []
+    problems: list[Any] = []
     while len(problems) < count:
         problem = next(iterator)
         if not problem.is_placeholder:
