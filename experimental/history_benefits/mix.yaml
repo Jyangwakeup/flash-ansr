@@ -1,0 +1,51 @@
+# Near-correct-history small-scale run (正式实验规则.md §12; 训练评估流程.md "近似历史小规模验证").
+version: 1
+model: models/psaegert/flash-ansr-v25.0-T8-3M
+recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
+train_recipe: configs/v25.0-T8.1-3M/train.yaml
+output: runs/history_benefits/mix
+# Problems 0..999, the 200 validation problems, their model pools and step-0 are linked from here
+# (same seeds, so the same problems; the link stage re-draws and compares them).
+reuse: runs/history_benefits/medium
+reuse_train_problems: 1000
+# seed: the shared step-0 initialization only; every other stream has its own seed below.
+seed: 20261120
+data_seed_train: 20261121
+data_seed_validation: 20261122
+train_seed: 20261123
+fit_seed: 20261124
+eval_seed: 20261125
+data_seed_fresh: 20261126       # on-the-fly training problems (none / near samples)
+data_seed_selection: 20261127   # checkpoint-selection problems (ids 200000..), never evaluated
+threads: 4
+workers: 4
+train_problems: 5000            # problems with a stored model pool (real-candidate samples)
+validation_problems: 200        # = the final evaluation problems of the medium run
+selection_problems: 200
+draws: 300
+restarts: 8
+keep: null
+history_top: 10
+max_length: 256
+generation_tokens: 128
+batch_size: 128
+micro_batch: 8
+steps: 2000
+warmup: 100
+cooldown_from: 1600             # lr linear to 0 between steps 1600 and 2000
+checkpoint_every: 250
+# sample kinds per batch (fractions); see mix_samples.py
+mix:
+  A: {none: 1.0}
+  C: {none: 0.3, near: 0.4, real: 0.3}
+# levels of the near-correct histories (corrupt.py)
+near_levels: {exact: 0.1, constants: 0.3, structure_1: 0.4, structure_2_3: 0.2}
+phase0_draws: 300
+phase1_draws: 700
+baseline_draws: 1000
+diagnose_problems: 100
+diagnose_draws: 50
+validation_sampling:
+  n_support: 512
+  n_validation: 512
+  noise: 0.0

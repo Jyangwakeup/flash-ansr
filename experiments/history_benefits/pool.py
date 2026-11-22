@@ -7,7 +7,7 @@ import numpy as np
 from flash_ansr import SoftmaxSamplingConfig
 from flash_ansr.utils.generation import PriorSamplingConfig
 from flash_ansr.utils.tensor_ops import mask_unused_variable_columns
-from common import VALIDATION_ID_OFFSET, ROOT, dump, fit_seed, load_base, source, split_seeds
+from common import SELECTION_ID_OFFSET, VALIDATION_ID_OFFSET, ROOT, dump, fit_seed, load_base, source, split_seeds
 
 
 def fvu(y: Any, pred: Any) -> Any:
@@ -32,13 +32,20 @@ def draw_problems(cfg: Any, split: Any, count: Any) -> Any:
     return problems
 
 
+#: First problem id of each split (split-seed configs).
+SPLIT_OFFSET = {"train": 0, "validation": VALIDATION_ID_OFFSET, "selection": SELECTION_ID_OFFSET}
+
+
 def split_of(cfg: Any, pid: Any) -> tuple[str, int]:
     """(split, index within the split) of a problem id.
 
-    Split-seed configs: train ids are 0.., validation ids VALIDATION_ID_OFFSET.., independent of
-    the training-set size. Legacy configs: train ids first, then validation.
+    Split-seed configs: train ids are 0.., validation ids VALIDATION_ID_OFFSET.., selection ids
+    SELECTION_ID_OFFSET.., independent of the training-set size. Legacy configs: train ids first,
+    then validation.
     """
     if split_seeds(cfg):
+        if pid >= SELECTION_ID_OFFSET:
+            return "selection", int(pid) - SELECTION_ID_OFFSET
         if pid >= VALIDATION_ID_OFFSET:
             return "validation", int(pid) - VALIDATION_ID_OFFSET
         if pid >= cfg["train_problems"]:
@@ -60,7 +67,7 @@ def prepare(cfg: Any, out: Any, ids: Any) -> Any:
             by_split.setdefault(split, []).append(index)
         for split, indices in by_split.items():
             drawn = draw_problems(cfg, split, max(indices) + 1)
-            offset = 0 if split == "train" else VALIDATION_ID_OFFSET
+            offset = SPLIT_OFFSET[split]
             for index in indices:
                 save_problem(cfg, out, offset + index, drawn[index])
         return None

@@ -100,6 +100,8 @@ def train(
     folder: Any = None,
     on_checkpoint: Any = None,
     on_step: Any = None,
+    batch_maker: Any = None,
+    validator: Any = None,
 ) -> Any:
     """Train ``group`` to ``total`` updates.
 
@@ -107,6 +109,11 @@ def train(
     steps saved in full (default: half-way and the end); ``resume``: a checkpoint to continue
     from (its weights, optimizer, RNG and sample position; the schedule is this call's);
     ``on_checkpoint(step)``: called after each checkpoint's validation.
+
+    ``batch_maker(step, rng) -> samples`` replaces the pool sampling (mix run): each sample
+    carries ``kind`` and a JSON-able ``info``; per-kind target CE is logged as ``ce_<kind>``.
+    ``validator(step) -> dict`` (with a ``loss`` key) replaces the validation-set loss; it is
+    then also the only use of ``val_ids`` (pools are loaded lazily, only for pool samples).
     """
     folder = Path(folder) if folder is not None else out / phase / group
     folder.mkdir(parents=True, exist_ok=True)
@@ -134,11 +141,14 @@ def train(
             group_lr["lr"] = base * factor(state["step"])
     reasons: Counter[str] = Counter()
     planned = actual = 0
-    problems = {pid: read_problem(out, pid) for pid in ids + val_ids}
-    pools = {
-        pid: read_pool(out, pid, "random" if group == "B" else "model")
-        for pid in ids + val_ids
-    }
+    problems: dict = {}
+    pools: dict = {}
+    if batch_maker is None:
+        problems = {pid: read_problem(out, pid) for pid in ids + val_ids}
+        pools = {
+            pid: read_pool(out, pid, "random" if group == "B" else "model")
+            for pid in ids + val_ids
+        }
 
     def make(pid: Any, seed: Any, validation: Any = False) -> Any:
         pool, yh = pools[pid]
@@ -147,6 +157,12 @@ def train(
         )
 
     def validate(step: Any) -> Any:
+        if validator is not None:
+            m.eval()
+            with torch.no_grad():
+                result = validator(step)
+            dump(folder / f"validation_{step}.json", dict(step=step, **result))
+            return
         m.eval()
         values = []
         with torch.no_grad():
@@ -174,41 +190,49 @@ def train(
             opt.zero_grad(set_to_none=True)
             values = []
             t0 = time.perf_counter()
-            picks = rng.choice(ids, size=cfg["batch_size"], replace=True)
-            seeds = rng.integers(0, 2**32 - 1, size=len(picks))
-            for begin in range(0, len(picks), cfg["micro_batch"]):
-                samples = []
-                for pid, seed in zip(
-                    picks[begin: begin + cfg["micro_batch"]],
-                    seeds[begin: begin + cfg["micro_batch"]],
-                ):
+            if batch_maker is not None:
+                made = batch_maker(step, rng)
+                if len(made) != cfg["batch_size"]:
+                    raise ValueError(f"batch_maker returned {len(made)} samples")
+            else:
+                picks = rng.choice(ids, size=cfg["batch_size"], replace=True)
+                seeds = rng.integers(0, 2**32 - 1, size=len(picks))
+                made = []
+                for pid, seed in zip(picks, seeds):
                     s = make(int(pid), int(seed))
-                    samples.append(s)
-                    planned += int(s["planned_history"])
+                    s["kind"] = "pool"
+                    s["info"] = dict(pid=int(pid), seed=int(seed), candidate=s["chosen"])
+                    made.append(s)
+            by_kind: dict[str, list[float]] = {}
+            for begin in range(0, len(made), cfg["micro_batch"]):
+                samples = made[begin: begin + cfg["micro_batch"]]
+                for s in samples:
+                    planned += int(s.get("planned_history", s["metadata"]["history_valid"]))
                     actual += int(s["metadata"]["history_valid"])
                     reasons[s["metadata"]["history_reason"]] += 1
                     sample_log.write(
                         json.dumps(
                             dict(
                                 step=step,
-                                pid=int(pid),
-                                seed=int(seed),
-                                planned_k=int(s["planned_history"]),
+                                kind=s["kind"],
+                                **s["info"],
+                                planned_k=int(s.get("planned_history", s["metadata"]["history_valid"])),
                                 actual_k=int(s["metadata"]["history_valid"]),
                                 unconditional=not s["metadata"].get(
                                     "condition_mask", True
                                 ),
                                 reason=s["metadata"]["history_reason"],
-                                candidate=s["chosen"],
                                 sequence_length=len(s["input_ids"]),
                             )
                         )
                         + "\n"
                     )
-                    if s["chosen"] is not None:
-                        usage[f'{pid}:{s["chosen"]}'] += 1
+                    if s.get("chosen") is not None and "pid" in s["info"]:
+                        usage[f'{s["info"]["pid"]}:{s["chosen"]}'] += 1
                 batch = collate(samples, m.tokenizer)
                 value, metrics = loss(m, batch)
+                for s, ce in zip(samples, metrics.pop("ce_rows")):
+                    by_kind.setdefault(s["kind"], []).append(ce)
                 if not torch.isfinite(value):
                     raise FloatingPointError(f"nonfinite loss {group}/{step}")
                 (value / (cfg["batch_size"] // cfg["micro_batch"])).backward()
@@ -226,6 +250,8 @@ def train(
                 grad_norm=norm.item(),
                 lr=opt.param_groups[0]["lr"],
                 **{k: float(np.mean([v[k] for v in values])) for k in values[0]},
+                **({f"ce_{k}": float(np.mean(v)) for k, v in by_kind.items()}
+                   if batch_maker is not None else {}),
             )
             log.write(json.dumps(row) + "\n")
             log.flush()
