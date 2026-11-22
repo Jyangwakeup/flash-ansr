@@ -51,21 +51,72 @@ def pct(v: Any) -> str:
     return "—" if v is None or v != v else f"{100 * v:.1f}%"
 
 
+FVU_BINS = ((0.0, 1e-3, "FVU < 1e-3"), (1e-3, 0.1, "FVU 1e-3–0.1"), (0.1, float("inf"), "FVU ≥ 0.1"))
+
+
+def fvu_bin(f: Any) -> str:
+    value = float("inf") if f is None else float(f)
+    return next(name for lo, hi, name in FVU_BINS if lo <= value < hi)
+
+
+def copy_rate_table(rows: list) -> list:
+    """Exploratory (规则 §12.7): copy rate and success by the support FVU of the given history."""
+    groups: dict = {}
+    for r in rows:
+        if r.get("history") is None or not r.get("phase1"):
+            continue
+        groups.setdefault(fvu_bin(r["history"]["fvu"]), []).append(r)
+    if not groups:
+        return []
+    lines = ["### 照抄率：按给的历史好坏分组（C 两阶段，探索性，规则 §12.7）", "",
+             "照抄率 = 第二阶段候选里与历史骨架相同的比例。理想情况：好历史多抄，差历史少抄。", "",
+             "| 历史在支撑点上的 FVU | 题数 | 平均照抄率 | 第二阶段解对率（vNRR） | 整题解对率（vNRR） |",
+             "|---|---|---|---|---|"]
+    for _, _, name in FVU_BINS:
+        g = groups.get(name, [])
+        if not g:
+            continue
+        copy = float(np.mean([r["phase1_same_as_history"] / max(r["phase1"]["n_candidates"], 1) for r in g]))
+        lines.append(f"| {name} | {len(g)} | {pct(copy)} | {pct(rate(g, 'top1_val', 'phase1'))} | "
+                     f"{pct(rate(g, 'top1_val'))} |")
+    return lines + [""]
+
+
+def ablation_tables(out: Any) -> list:
+    """Exploratory (规则 §12.7): input ablation of the history, one table per checkpoint."""
+    files = sorted((out / "ablation").glob("*.json"))
+    if not files:
+        return []
+    lines = ["## 历史的输入消融（验证集，目标交叉熵损失，探索性，规则 §12.7）", "",
+             "同一个样本打五次分，只改历史：不给 / 完整 / 只给公式（预测值清零）/ 预测值错配（换成别的题的）/ "
+             "预测值完美（换成 y）。只做前向计算，不训练。", ""]
+    for path in files:
+        r = json.loads(path.read_text())
+        lines += [f"### `{r['checkpoint']}`（跳过 {r['skipped']} 个样本）", "",
+                  "| 组 | 样本数 | 不给 | 完整 | 只给公式 | 预测值错配 | 预测值完美 | 完整比不给更低 |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for label, row in r["table"].items():
+            cells = " | ".join(f"{row[c]:.3f}" for c in ("none", "full", "tokens_only", "mismatched", "perfect"))
+            lines.append(f"| {label} | {row['n']} | {cells} | {pct(row['helped_vs_none'])} |")
+        lines.append("")
+    return lines
+
+
 def report(cfg: Any, out: Any) -> None:
     lines = ["# 近似历史小规模验证：自动表格", "",
              f"配置：`{cfg['output']}/config.yaml`；规则：正式实验规则.md §12。题数小时请看置信区间。", ""]
     summary: dict = {}
 
     # -- training: selected checkpoint, selection loss per checkpoint ----------------------
-    lines += ["## 选中的 checkpoint（事先定的规则：选择集 loss 最低，打平取后面的步）", "",
-              "| 组 | 选中步 | 选择集 loss |", "|---|---|---|"]
+    lines += ["## 选中的 checkpoint（预注册规则：验证集损失最低，打平取后面的步）", "",
+              "| 组 | 选中步 | 验证集损失 |", "|---|---|---|"]
     for g in ("A", "C"):
         path = out / "train" / g / "selected.json"
         if path.exists():
             sel = json.loads(path.read_text())
             lines.append(f"| {g} | {sel['step']} | {sel['loss']:.4f} |")
             summary[f"selected_step_{g}"] = sel["step"]
-    lines += ["", "## 选择集 loss（目标公式的交叉熵，按样本类型）", "",
+    lines += ["", "## 验证集损失（目标公式的交叉熵，按样本类型；验证集 = 题号 200000 起，代码里叫 selection）", "",
               "| 组 | 步 | 不给历史 | 接近正确 | 真实候选 | 加权（挑选标准） |", "|---|---|---|---|---|---|"]
     for g in ("A", "C"):
         files = sorted((out / "train" / g).glob("validation_*.json"), key=lambda p: int(p.stem.split("_")[1]))
@@ -104,7 +155,7 @@ def report(cfg: Any, out: Any) -> None:
         lines += ["", "结构改动种类：" + "，".join(f"{k} {v}" for k, v in edits.most_common()), ""]
 
     # -- final evaluation -------------------------------------------------------------------
-    lines += ["## 完整流程评测（验证题，题数见表）", "",
+    lines += ["## 完整流程评测（开发集 = 题号 100000 起的 200 道，代码里叫 validation）", "",
               "| 条件 | 题数 | vNRR（主指标） | fNRR | Oracle | 平均秒/题 |", "|---|---|---|---|---|---|"]
     table = []
     for name, label in [*CONDITION_LABELS.items(), *((f"medium:{k}", v) for k, v in MEDIUM_REFS.items())]:
@@ -131,6 +182,7 @@ def report(cfg: Any, out: Any) -> None:
     if c_two:
         same = [r["phase1_same_as_history"] / max(r["phase1"]["n_candidates"], 1) for r in c_two if r.get("phase1")]
         lines += ["", f"C 两阶段第二阶段里，和历史骨架相同的候选平均占 {pct(float(np.mean(same)))}。", ""]
+        lines += copy_rate_table(c_two)
 
     # -- diagnostics ----------------------------------------------------------------------
     diag_path = out / "diagnostics" / "history_use.json"
@@ -139,7 +191,7 @@ def report(cfg: Any, out: Any) -> None:
         diag = json.loads(diag_path.read_text()).get("C", {})
         gen = diag.get("generation", {})
         lossd = diag.get("loss_delta_vs_none", {})
-        lines += ["## 读历史诊断（C，选中的 checkpoint）", "",
+        lines += ["## 读历史诊断（C，选中的 checkpoint，开发集前 100 道）", "",
                   "| 给什么历史 | 题数 | Oracle（候选里有解对的） | Top-1 | 目标 loss 变化（相对不给） |",
                   "|---|---|---|---|---|"]
         for k, v in gen.items():
@@ -152,8 +204,10 @@ def report(cfg: Any, out: Any) -> None:
             summary["diagnose/none_oracle"] = gen["none"]["oracle_val"]
         lines.append("")
 
+    lines += ablation_tables(out)
+
     # -- pre-registered criteria -----------------------------------------------------------
-    lines += ["## 事先定的判断标准", ""]
+    lines += ["## 预注册的判断标准", ""]
     if learned is not None:
         lines.append(f"- 学会读历史（原样历史的 Oracle ≥ 50% 且高于不给）：**{'是' if learned else '否'}**")
     for key, label in ((("self_C_two", "self_C_direct"), "C 两阶段 > C 直接"),

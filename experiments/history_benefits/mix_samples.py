@@ -72,14 +72,18 @@ class MixSampler:
         return True
 
     # -- samples -------------------------------------------------------------------------
-    def near(self, problem: Any, rng: Any) -> dict | None:
-        level = LEVELS[int(rng.choice(len(LEVELS), p=self.levels))]
-        return near_correct(problem, level, rng, self.engine, self.tokenizable)
+    def near(self, problem: Any, rng: Any, level: Any = None) -> dict | None:
+        drawn = LEVELS[int(rng.choice(len(LEVELS), p=self.levels))]  # always drawn: same rng path
+        return near_correct(problem, level or drawn, rng, self.engine, self.tokenizable)
 
     def make(self, kind: str, rng: Any, fresh_key: tuple = (), validation: bool = False,
-             pid: Any = None) -> Any:
+             pid: Any = None, level: Any = None, drop_history: bool = False) -> Any:
         """One sample of ``kind``. ``fresh_key`` seeds the fresh problem (none/near); ``pid``
-        names a stored problem instead (selection set, and every real sample)."""
+        names a stored problem instead (selection set, and every real sample).
+
+        Ablations (ablate.py): ``level`` forces the near-correct level; ``drop_history`` makes
+        every choice exactly as with history (same rng path, same problem and rows) but builds
+        the sample without it, so the two differ only in the history."""
         if kind == "real":
             for _ in range(20):
                 if pid is None:
@@ -90,20 +94,21 @@ class MixSampler:
                 pid = None  # an empty pool: draw another problem
             chosen = int(rng.integers(len(rows)))
             s = history_sample(self.cfg, self.model, self.wc, self.catalog, problem, rng,
-                               (rows[chosen]["expression_prefix"], yh[chosen]), validation)
+                               None if drop_history else (rows[chosen]["expression_prefix"], yh[chosen]),
+                               validation)
             s["info"] = dict(pid=pid, candidate=chosen, history_fvu=rows[chosen]["fvu"])
             s["chosen"] = chosen if s["metadata"]["history_valid"] else None
         else:
             for attempt in range(10):
                 problem = (read_problem(self.out, pid) if pid is not None
                            else self.fresh(*fresh_key, *([attempt] if attempt else [])))
-                hist = self.near(problem, rng) if kind == "near" else None
+                hist = self.near(problem, rng, level) if kind == "near" else None
                 if kind == "none" or hist is not None:
                     break
                 # a stored problem retries with the advanced rng; a fresh one takes a new problem
             else:
                 raise RuntimeError(f"no near-correct history for {pid if pid is not None else fresh_key}")
-            history = (hist["expression"], hist["predictions"]) if hist else None
+            history = (hist["expression"], hist["predictions"]) if hist and not drop_history else None
             s = history_sample(self.cfg, self.model, self.wc, self.catalog, problem, rng,
                                history, validation)
             s["info"] = dict(pid=pid) if pid is not None else dict(fresh=[*fresh_key, attempt])
