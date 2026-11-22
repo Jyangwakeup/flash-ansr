@@ -5,8 +5,12 @@ a) Target loss with vs without history (the same sample, same rng, history ids o
 b) Near-correct histories built from the true formula -- exact, constants x1.3, one variable
    swapped -- versus none: loss on the target, and generation (probe draws, held-out success).
    If even the exact answer does not help, the model has not learned to read history at all.
+   ``t8_candidate``: the history the evaluation would give (one of the first history_top of the
+   stored T8 model pool, chosen by the eval seed), for comparison with the made-up ones.
 
     python experiments/history_benefits/diagnose.py [--groups B C] [--n 100] [--draws 50]
+    python experiments/history_benefits/diagnose.py --config experimental/history_benefits/mix.yaml \
+        --groups C --selected        # the mix run: its pre-registered selected checkpoint
 
 Results: <output>/diagnostics/history_use.json (and printed). Not part of the locked rules: a
 diagnostic added after the medium results.
@@ -25,7 +29,8 @@ from flash_ansr.data.streaming import build_training_sample
 
 from common import ROOT, collate, dump, history_ids, loss, problem_ids, read_problem, source, worker_config
 from medium import load_checkpoint, load_step0
-from medium_eval import EPS32, generate, outcome, wrapper_for
+from medium_eval import EPS32, choose_history, generate, outcome, wrapper_for
+from common import read_pool
 
 
 def variants(problem: Any) -> dict:
@@ -81,6 +86,8 @@ def main() -> None:
     parser.add_argument("--groups", nargs="+", default=["B", "C"])
     parser.add_argument("--n", type=int, default=100)
     parser.add_argument("--draws", type=int, default=50)
+    parser.add_argument("--selected", action="store_true",
+                        help="use train/<group>/selected.json (mix run) instead of the cooldown step")
     args = parser.parse_args()
     cfg = yaml.safe_load((ROOT / args.config).read_text())
     torch.set_num_threads(cfg["threads"])
@@ -91,8 +98,17 @@ def main() -> None:
     wc = worker_config(cfg, m, recipe)
     engine = m.simplipy_engine
     report: dict = {"problems": len(ids), "draws": args.draws}
+    from wb import Run
+
+    run = Run(cfg, out, "diagnose-" + "".join(args.groups), "diagnose",
+              dict(groups=args.groups, problems=len(ids), draws=args.draws, selected=args.selected))
     for g in args.groups:
-        load_checkpoint(m, out / "cooldown" / g / f"checkpoint_{cfg['steps']}.pt")
+        if args.selected:
+            ckpt = ROOT / json.loads((out / "train" / g / "selected.json").read_text())["checkpoint"]
+        else:
+            ckpt = out / "cooldown" / g / f"checkpoint_{cfg['steps']}.pt"
+        load_checkpoint(m, ckpt)
+        report.setdefault("checkpoints", {})[g] = str(ckpt)
         m.eval()
         wrapper = wrapper_for(cfg, m)
         losses: dict = {}
@@ -101,6 +117,10 @@ def main() -> None:
             for pid in ids:
                 p = read_problem(out, pid)
                 hists = {"none": None, **variants(p)}
+                pool, _ = read_pool(out, pid, "model")
+                chosen = choose_history(cfg, pid, pool)
+                if chosen is not None:
+                    hists["t8_candidate"] = list(pool[chosen]["expression_prefix"])
                 base = sample(p, wc, src.catalog, None, None, cfg["eval_seed"] + pid, m)
                 if base is None:
                     continue
@@ -130,6 +150,8 @@ def main() -> None:
                         copies=sum(c["fvu_val"] <= EPS32 for c in r["candidates"]),
                         reason=r["reason"]))
                 print(f"{g} {pid} done", flush=True)
+                run.log({f"{g}/running_oracle/{k}": float(np.mean([x["oracle_val"] for x in v]))
+                         for k, v in gen.items()}, step=len(gen.get("none", [])))
         finally:
             wrapper.close()
         report[g] = {
@@ -143,6 +165,10 @@ def main() -> None:
         }
         print(json.dumps({k: report[g][k] for k in ("loss_delta_vs_none", "generation")}, indent=1), flush=True)
     dump(out / "diagnostics" / "history_use.json", report)
+    run.summary({f"{g}/{part}/{k}": v[metric] for g in args.groups
+                 for part, metric in (("generation", "oracle_val"), ("loss_delta_vs_none", "mean"))
+                 for k, v in report[g][part].items()})
+    run.finish()
 
 
 if __name__ == "__main__":

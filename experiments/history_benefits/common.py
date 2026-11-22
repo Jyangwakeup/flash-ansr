@@ -62,26 +62,33 @@ def sha(path: Any) -> Any:
 
 #: Config keys of the per-split problem seeds. ProblemSource ignores ``sampling.seed`` and draws
 #: from OS entropy unless it is handed an ``rng``; these keys are what makes problems reproducible.
-DATA_SEED_KEYS = {"train": "data_seed_train", "validation": "data_seed_validation"}
+DATA_SEED_KEYS = {"train": "data_seed_train", "validation": "data_seed_validation",
+                  # mix run: on-the-fly training problems, and the checkpoint-selection set
+                  "fresh": "data_seed_fresh", "selection": "data_seed_selection"}
+_REQUIRED_SPLITS = ("train", "validation")
 
 
 def split_seeds(cfg: Any) -> bool:
     """True when the config pins one problem stream per split (the formal-rules layout)."""
-    present = [key in cfg for key in DATA_SEED_KEYS.values()]
+    present = [DATA_SEED_KEYS[s] in cfg for s in _REQUIRED_SPLITS]
     if any(present) and not all(present):
-        raise ValueError(f"set both or neither of {sorted(DATA_SEED_KEYS.values())}")
+        raise ValueError(f"set both or neither of {[DATA_SEED_KEYS[s] for s in _REQUIRED_SPLITS]}")
     return all(present)
 
 
 #: Validation problem ids start here in split-seed configs, so a validation problem keeps its id
 #: (and its pool file) when the number of training problems grows.
 VALIDATION_ID_OFFSET = 100_000
+#: Checkpoint-selection problems (mix run): their own seed, ids from here, never evaluated.
+SELECTION_ID_OFFSET = 200_000
 
 
 def problem_ids(cfg: Any, split: Any, count: Any) -> list[int]:
     """Ids of the first ``count`` problems of ``split``."""
     if split == "train":
         return list(range(int(count)))
+    if split == "selection":
+        return list(range(SELECTION_ID_OFFSET, SELECTION_ID_OFFSET + int(count)))
     offset = VALIDATION_ID_OFFSET if split_seeds(cfg) else int(cfg["train_problems"])
     return list(range(offset, offset + int(count)))
 
@@ -117,7 +124,7 @@ def source(cfg: Any, split: Any = None) -> Any:
     rng = None
     if split_seeds(cfg) and split is not None:
         rng = np.random.default_rng(int(cfg[DATA_SEED_KEYS[split]]))
-        if split == "validation" and cfg.get("validation_sampling"):
+        if split in ("validation", "selection") and cfg.get("validation_sampling"):
             # Evaluation problems follow srbf's protocol (noiseless, a held-out split): same
             # catalog as training, only the sampling block is replaced.
             sc["sampling"] = {**dict(cfg["validation_sampling"]), "seed": cfg["seed"]}
@@ -236,24 +243,33 @@ def read_pool(directory: Any, pid: Any, kind: Any) -> Any:
     return row["candidates"], yh
 
 
-def assemble(
-    cfg: Any,
-    model: Any,
-    wc: Any,
-    catalog: Any,
-    problem: Any,
-    pool: Any,
-    predictions: Any,
-    seed: Any,
-    group: Any,
-    validation: Any = False,
-) -> Any:
-    rng = np.random.default_rng(seed)
-    want = group != "A" and bool(rng.random() < 0.5)
-    chosen = (
-        int(rng.integers(min(cfg["history_top"], len(pool)))) if want and pool else None
+def as_problem(problem: Any) -> Any:
+    """A freshly drawn problem in the form ``read_problem`` returns (same column masking as
+    ``pool.save_problem``), for on-the-fly training samples that are never written to disk."""
+    from flash_ansr.utils.tensor_ops import mask_unused_variable_columns
+
+    x = problem.x_support.copy()
+    mask_unused_variable_columns(arrays=(x,), variables=list(problem.variables),
+                                 skeleton_tokens=list(problem.skeleton), padding="zero")
+    return SimpleNamespace(
+        skeleton=list(problem.skeleton), constants=list(problem.constants),
+        expression=list(problem.expression), variables=list(problem.variables),
+        noise=problem.noise, is_placeholder=False, x_support=x,
+        y_support=problem.y_support.copy(), y_support_noisy=problem.y_support_noisy.copy(),
+        outlier_mask_support=(problem.outlier_mask_support.copy()
+                              if problem.outlier_mask_support is not None else np.zeros(len(x))),
+        x_validation=None, y_validation=None,
     )
-    ids = history_ids(model, pool[chosen]) if chosen is not None else []
+
+
+def history_sample(
+    cfg: Any, model: Any, wc: Any, catalog: Any, problem: Any, rng: Any,
+    history: Any = None, validation: Any = False,
+) -> Any:
+    """One training sample of ``problem``; ``history`` is ``(expression_prefix, support
+    predictions)`` or None. The history column is zero unless the history made it into the
+    sequence (``metadata.history_valid``)."""
+    ids = history_ids(model, {"expression_prefix": history[0]}) if history is not None else []
     sample = build_training_sample(
         problem,
         replace(wc, unconditional_prob=0 if validation else wc.unconditional_prob),
@@ -267,10 +283,37 @@ def assemble(
         raise ValueError(f"Unassemblable target: {sample}")
     valid = sample["metadata"]["history_valid"]
     sample["history"] = (
-        predictions[chosen][sample["row_indices"]]
-        if valid
+        np.asarray(history[1])[sample["row_indices"]]
+        if valid and history is not None
         else np.zeros(len(sample["row_indices"]))
     )
+    return sample
+
+
+def assemble(
+    cfg: Any,
+    model: Any,
+    wc: Any,
+    catalog: Any,
+    problem: Any,
+    pool: Any,
+    predictions: Any,
+    seed: Any,
+    group: Any,
+    validation: Any = False,
+    want: Any = None,
+) -> Any:
+    """A pool-history sample (medium run): history planned with probability 0.5 for B/C
+    (``want`` forces it), one of the first ``history_top`` pool candidates."""
+    rng = np.random.default_rng(seed)
+    planned = group != "A" and bool(rng.random() < 0.5)
+    want = planned if want is None else bool(want)
+    chosen = (
+        int(rng.integers(min(cfg["history_top"], len(pool)))) if want and pool else None
+    )
+    history = (pool[chosen]["expression_prefix"], predictions[chosen]) if chosen is not None else None
+    sample = history_sample(cfg, model, wc, catalog, problem, rng, history, validation)
+    valid = sample["metadata"]["history_valid"]
     sample["planned_history"] = want
     sample["chosen"] = chosen if valid else None
     if want and not pool:
@@ -323,12 +366,15 @@ def loss(model: Any, batch: Any) -> Any:
     logits = model(
         **{k: v for k, v in batch.items() if k not in ("labels", "outliers")}
     )[:, :-1]
-    ce = F.cross_entropy(
+    token_ce = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         labels.flatten(),
         ignore_index=model.tokenizer["<pad>"],
-        reduction="sum",
-    ) / valid.sum().clamp_min(1)
+        reduction="none",
+    ).view(labels.shape)
+    ce = token_ce.sum() / valid.sum().clamp_min(1)
+    # per-sample mean target CE (for loss by sample kind); not part of the gradient
+    rows = (token_ce.detach().sum(1) / valid.sum(1).clamp_min(1)).tolist()
     ol = model.outlier_head(model.point_representations).squeeze(-1)
     pm = batch["data_attn_mask"]
     bce = (
@@ -341,4 +387,5 @@ def loss(model: Any, batch: Any) -> Any:
         "ce": ce.item(),
         "outlier": bce.item(),
         "z": z.item(),
+        "ce_rows": rows,
     }
