@@ -61,7 +61,8 @@ class MixSampler:
         if pid not in self._pools:
             rows, yh = read_pool(self.out, pid, "model")
             top = self.cfg["history_top"]
-            self._pools[pid] = (read_problem(self.out, pid), rows[:top], yh[:top])
+            # copy: a numpy slice is a view that would keep the whole predictions array in memory
+            self._pools[pid] = (read_problem(self.out, pid), rows[:top], yh[:top].copy())
         return self._pools[pid]
 
     def tokenizable(self, expr: list) -> bool:
