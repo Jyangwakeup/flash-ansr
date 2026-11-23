@@ -1,62 +1,86 @@
-# 统一训练器（HistoryTrainer）：什么时候做、到时候怎么做
+# Unified history trainer: when to build it and how
 
-状态：**暂不实施**（2026-11-23 评估）。现在 `experiments/history_benefits/core/train.py` 的"固定循环 + 可换插口"已经够用。第 3、4 轮都只写了自己的 `batch_maker` / `validator`，core 一行没改。
+**Status: deferred (assessed 2026-11-23).** The fixed loop with plug-ins in
+`experiments/history_benefits/core/train.py` is enough for now. Rounds 3 and 4 each
+supplied their own `batch_maker` / `validator` and left core untouched.
 
-## 为什么现在不做
+## Why not now
 
-| 看什么 | 2026-11-23 的情况 |
+| Question | State on 2026-11-23 |
 |---|---|
-| 新的一轮接得进来吗 | 能，r3、r4 都没改 core |
-| 训练器是不是瓶颈 | 不是。3M 参数的模型，CPU 上 1000–2000 步，几小时跑完 |
-| 输入结构定了吗 | 没定。可能变成多条历史、只要公式不要预测、历史改放到别处、完全不同的额外输入。现在包装，接口只能靠猜 |
-| 继承原作者的 `Trainer` 能白拿功能吗 | 不能。它调用模型时不传 `history_mask`，数据流水线（`streaming.py`）不生成历史样本，检查点不存随机数状态，取数据、调用模型、`wandb.init` 都写死在长函数中间 |
+| Can a new round plug in without editing core? | Yes. r3 and r4 did not change core. |
+| Is the trainer the bottleneck? | No. A 3M-parameter model trains 1,000–2,000 steps on CPU in a few hours. |
+| Is the input structure settled? | No. It may become several histories, the formula without predictions, history fed through a different path, or an entirely different extra input. A trainer built now would have to guess the interface. |
+| Does subclassing the original `Trainer` give these features for free? | No. It never passes `history_mask` to the model. Its streaming pipeline (`streaming.py`) builds no history samples. Its checkpoints keep no RNG state. Batch fetching, the model call and `wandb.init` are inlined in long methods. |
 
-## 什么时候必须做（满足任意一条就开工）
+## Triggers: start as soon as any one holds
 
-1. **第一轮要上 GPU 时。** `core/train.py` 的设备写死为 CPU，没有混合精度；样本在主进程里一条一条造，上了 GPU 后造数据会成为瓶颈。
-2. **第一轮需要改 `collate` 时**，也就是把样本拼成模型输入的方式变了，比如多条历史，或者历史不再是数据第 19 列。`core/train.py` 直接 import `common.collate`，而 `collate` 写死了 19 列。
-3. 模型明显变大，或者单轮训练超过一天。
+1. **A round needs a GPU.** `core/train.py` runs on CPU only, has no mixed precision, and
+   builds samples one at a time in the main process, so on a GPU data generation becomes
+   the bottleneck.
+2. **A round needs a different `collate`**, i.e. samples become model inputs in a
+   different way: several histories, or history no longer in data column 19.
+   `core/train.py` imports `common.collate` directly, and `common.collate` hard-codes
+   19 columns.
+3. The model grows substantially, or a single round trains for more than a day.
 
-## 到时候怎么做
+## Design
 
-**位置。** 新文件 `src/flash_ansr/train/history_trainer.py`。原作者的 `Trainer` 和 `experiments/history_benefits/core/` 都不改，前几轮继续用旧代码，保证可复现。
+**Location.** A new file, `src/flash_ansr/train/history_trainer.py`. Neither the original
+`Trainer` nor `experiments/history_benefits/core/` changes, so earlier rounds keep
+running on the code that produced their results.
 
-**和输入结构解耦。** 训练器只认一个约定：
+**Independence from the input structure.** The trainer relies on one contract:
 
 ```python
 batch = input_format.collate(samples, device)
 # batch = {
-#   "inputs": {...},          # 原样传给 model(**inputs)，训练器不看里面有什么
-#   "labels": LongTensor,     # [b, T-1]，不计 loss 的位置填 <pad>
+#   "inputs": {...},          # passed as-is to model(**inputs); the trainer never looks inside
+#   "labels": LongTensor,     # [b, T-1], <pad> where no loss is taken
 #   "outlier_target": Tensor | None,
 #   "point_mask": BoolTensor | None,
-#   "kinds": list[str],       # 每条样本的类别，用于按类别统计 CE
+#   "kinds": list[str],       # per-sample kind, for per-kind CE
 # }
 logits = model(**batch["inputs"])[:, :-1]
 ```
 
-换输入结构时，只需要写一个新的 `collate` 和对应的模型配置开关，训练器不用改。数据列数从 `model.encoder_max_n_variables + model.history_slots` 读，不写死。
+To change the input structure, write a new `collate` and the matching model config
+switch; the trainer does not change. The data width comes from
+`model.encoder_max_n_variables + model.history_slots` and is never a literal.
 
-**样本来源。** `source.batch(step, rng) -> list[sample]`，每条样本带 `kind`，签名和现在的 `batch_maker` 一样，`MixSampler` 可以直接接上。随机数分两种模式：
+**Sample source.** `source.batch(step, rng) -> list[sample]`, with a `kind` on each
+sample. This is the signature of today's `batch_maker`, so `MixSampler` plugs in
+unchanged. Two RNG modes:
 
-- `sample_rng: sequential`：一条随机数流，存进检查点。这是现在的行为。
-- `sample_rng: per_step`：每一步的随机数只由 `(seed, step)` 决定。这样可以用多个进程提前造后面几步的数据，进程数不同，结果也一样。
+- `sample_rng: sequential` keeps one RNG stream and saves it in checkpoints. This is
+  today's behaviour.
+- `sample_rng: per_step` makes each step's RNG a function of `(seed, step)` only. Worker
+  processes can then build upcoming batches ahead of time, and the samples are the same
+  for any number of workers.
 
-**复用现成代码。**
+**Reuse.**
 
-- `build_optimizer`：`src/flash_ansr/train/optimizers.py`
-- `pw_linear_schedule`：`src/flash_ansr/train/schedules.py`
-- `_z_loss`：`src/flash_ansr/train/train.py`
-- 检查点和随机数状态的保存/恢复：`core/train.py` 的 `checkpoint` / `restore`，加上 GradScaler 和 CUDA 的随机数状态
+- `build_optimizer`: `src/flash_ansr/train/optimizers.py`
+- `pw_linear_schedule`: `src/flash_ansr/train/schedules.py`
+- `_z_loss`: `src/flash_ansr/train/train.py`
+- Checkpoint and RNG save/restore: `checkpoint` / `restore` in `core/train.py`, extended
+  with the GradScaler and CUDA RNG state.
 
-**新增配置项。** `device`、`amp_dtype`（none / bf16 / fp16，fp16 时开 GradScaler）、`compile`、`grad_clip`（默认 2.0）、loss 权重（默认 0.05 / 1e-4）。W&B 通过传入的 logger 对象记录（有 `.log(dict, step)` 就行），`src/` 不 import `experiments/`。本地照样写 `metrics.jsonl` / `samples.jsonl`。
+**New config keys.** `device`; `amp_dtype` (none / bf16 / fp16, with a GradScaler for
+fp16); `compile`; `grad_clip` (default 2.0); loss weights (default 0.05 / 1e-4).
 
-**验收。**
+**Logging.** W&B logging goes through an injected logger object (anything with
+`.log(dict, step)`), so `src/` never imports `experiments/`. Local `metrics.jsonl` and
+`samples.jsonl` are still written.
 
-1. 逐步对数：用 r3 的 `smoke.yaml`、C 组，在 CPU、fp32 下，旧的 `core/train.py` 和新训练器各跑 20 步，每一步的 loss、学习率和最终权重都要完全一致（`atol=0`）。
-2. 单元测试 `tests/test_train/test_history_trainer.py`：
-   - 小模型（`history_slots=1`）跑 2 步。
-   - 一口气跑 4 步，和跑 2 步、存档、恢复后再跑 2 步，权重要完全一致。
-   - `per_step` 模式下，进程数不同，样本完全一样。
-   - 换一个不带历史的 `collate`，训练器照常运行。
-3. 有 GPU 后：用 bf16 跑 50 步，loss 曲线和 CPU fp32 接近。
+## Acceptance
+
+1. **Step-by-step equivalence.** On r3's `smoke.yaml`, group C, CPU, fp32: run 20 steps
+   with the old `core/train.py` and 20 with the new trainer. Every step's loss and
+   learning rate, and the final weights, must match exactly (`atol=0`).
+2. **Unit tests** in `tests/test_train/test_history_trainer.py`:
+   - A tiny model with `history_slots=1` trains for 2 steps.
+   - 4 straight steps give the same weights as 2 steps, checkpoint, resume, 2 more steps.
+   - In `per_step` mode, the samples are identical for any number of workers.
+   - A `collate` without history runs through the same trainer unchanged.
+3. **Once a GPU is available:** 50 steps in bf16 give a loss curve close to the CPU fp32 run.
