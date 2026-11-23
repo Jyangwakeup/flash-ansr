@@ -1,4 +1,4 @@
-"""Shared, deterministic primitives for the history engineering pilot."""
+"""Shared, deterministic primitives of the history experiment (every round uses them)."""
 
 from __future__ import annotations
 from typing import Any
@@ -25,7 +25,7 @@ from flash_ansr.train.train import _z_loss
 from symbolic_data import ProblemSource
 from symbolic_data.token_ops import tagged_canonical
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def dump(path: Any, value: Any) -> Any:
@@ -63,7 +63,7 @@ def sha(path: Any) -> Any:
 #: Config keys of the per-split problem seeds. ProblemSource ignores ``sampling.seed`` and draws
 #: from OS entropy unless it is handed an ``rng``; these keys are what makes problems reproducible.
 DATA_SEED_KEYS = {"train": "data_seed_train", "validation": "data_seed_validation",
-                  # mix run: on-the-fly training problems, and the checkpoint-selection set
+                  # round 3: on-the-fly training problems, and the checkpoint-selection set
                   "fresh": "data_seed_fresh", "selection": "data_seed_selection"}
 _REQUIRED_SPLITS = ("train", "validation")
 
@@ -79,7 +79,7 @@ def split_seeds(cfg: Any) -> bool:
 #: Validation problem ids start here in split-seed configs, so a validation problem keeps its id
 #: (and its pool file) when the number of training problems grows.
 VALIDATION_ID_OFFSET = 100_000
-#: Checkpoint-selection problems (mix run): their own seed, ids from here, never evaluated.
+#: Checkpoint-selection problems (round 3): their own seed, ids from here, never evaluated.
 SELECTION_ID_OFFSET = 200_000
 
 
@@ -303,7 +303,7 @@ def assemble(
     validation: Any = False,
     want: Any = None,
 ) -> Any:
-    """A pool-history sample (medium run): history planned with probability 0.5 for B/C
+    """A pool-history sample (round 2): history planned with probability 0.5 for B/C
     (``want`` forces it), one of the first ``history_top`` pool candidates."""
     rng = np.random.default_rng(seed)
     planned = group != "A" and bool(rng.random() < 0.5)

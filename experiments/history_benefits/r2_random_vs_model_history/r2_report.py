@@ -1,15 +1,14 @@
-"""Medium-scale report (流程 §8, 规则 §6): tables, paired bootstrap CIs, curves; also to W&B."""
+"""Round-2 report (流程 §8, 规则 §6): tables, paired bootstrap CIs, curves; also to W&B."""
 
 from typing import Any
 import json
-from pathlib import Path
 
 import numpy as np
 
-from common import ROOT, train_seed
-from medium_eval import CONDITIONS
+from common import train_seed
+from r2_conditions import CONDITIONS
+from stats import paired, solved
 
-N_BOOT = 10_000
 H4_TOLERANCE = 0.03
 LABELS = {
     "1_A_none": "① A 不给历史",
@@ -39,20 +38,6 @@ def load(out: Any, name: Any) -> Any:
     return json.loads(path.read_text())["rows"] if path.exists() else None
 
 
-def solved(rows: Any, key: Any = "top1_val") -> dict:
-    return {r["pid"]: bool(r["merged"] and r["merged"][key]) for r in rows}
-
-
-def paired(a: Any, b: Any, seed: Any) -> dict:
-    """Paired difference of success rates (a − b) over common problems, bootstrap 95% CI."""
-    ids = sorted(set(a) & set(b))
-    d = np.array([a[i] - b[i] for i in ids], dtype=float)
-    rng = np.random.default_rng(seed)
-    boots = d[rng.integers(0, len(d), size=(N_BOOT, len(d)))].mean(axis=1) if len(d) else np.array([np.nan])
-    return dict(n=len(ids), diff=float(d.mean()) if len(d) else float("nan"),
-                lo=float(np.percentile(boots, 2.5)), hi=float(np.percentile(boots, 97.5)))
-
-
 def rate(rows: Any, part: Any, key: Any) -> float:
     return sum(bool(r[part] and r[part][key]) for r in rows) / len(rows)
 
@@ -62,10 +47,10 @@ def report(cfg: Any, out: Any) -> None:
 
     names = list(CONDITIONS) + ["original_T8", "step0_none"]
     data = {n: load(out, n) for n in names}
-    lines = ["# 中等规模报告", "",
+    lines = ["# 第 2 轮：随机历史 vs 模型历史（自动表格）", "",
              f"产物：`{cfg['output']}`（配置副本：`{cfg['output']}/config.yaml`）。",
-             "规则：[正式实验规则.md](正式实验规则.md)；流程：[训练评估流程.md](训练评估流程.md)。", "",
-             "**中等规模的结果只用来判断方向，不当作正式结论。** 主结果为收尾支线第 1,000 步；",
+             "规则：[0-实验规则.md](0-实验规则.md)；流程：[0-训练评估流程.md](0-训练评估流程.md)。", "",
+             "**第 2 轮的结果只用来判断方向，不当作正式结论。** 主结果为收尾支线第 1,000 步；",
              "解对 = 留出点 FVU ≤ float32 eps；所有题都在分母里，没有答案记为没解对。", "",
              "## 主表（同样 1000 个预算）", "",
              "| 条件 | 题数 | vNRR | fNRR | Oracle（留出点） | 第二阶段自身 vNRR | 第一阶段未解出的题中新解出 | 平均秒数/题 |",
@@ -189,11 +174,8 @@ def report(cfg: Any, out: Any) -> None:
                              f"{v0:.1%} | {'' if v1 != v1 else f'{v1:.1%}'} |")
                 curves.append([g, line, step, loss, v0, v1])
     lines += ["", "主线学习率未降；收尾支线第 800–1,000 步学习率降到 0。曲线只看趋势，不用来挑模型。", ""]
-    # only the real medium run writes the shared report; other configs (smoke) keep theirs local
-    if Path(str(cfg["output"])).name == "medium":
-        path = ROOT / "experiment-results/history-benefits/中等规模报告.md"
-    else:
-        path = out / "报告.md"
+    # generated tables stay in the run folder; experiment-results/ holds the hand-edited report
+    path = out / "报告.md"
     path.write_text("\n".join(lines))
     print(f"wrote {path}", flush=True)
 

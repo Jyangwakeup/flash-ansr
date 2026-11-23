@@ -7,7 +7,7 @@
   .venv/bin/python experiments/T8vsT8-1/run.py full      # 跑全部 40 道验证题
   .venv/bin/python experiments/T8vsT8-1/run.py summarize # 只汇总已有结果
 
-不改动 experiments/history_benefits 下的代码，也不写入 runs/history_benefits/pilot；结果保存在 runs/T8vsT8-1/。
+不改动 experiments/history_benefits 下的代码，也不写入 runs/history_benefits/r1_pipeline_check；结果保存在 runs/T8vsT8-1/。
 """
 
 import argparse
@@ -23,7 +23,8 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-sys.path.insert(0, str(ROOT / "experiments/history_benefits"))
+sys.path.insert(0, str(ROOT / "experiments/history_benefits/core"))
+sys.path.insert(0, str(ROOT / "experiments/history_benefits/r1_pipeline_check"))  # evaluate.py
 sys.path.insert(0, str(ROOT / "experiments"))
 
 from exp_wandb import Run  # noqa: E402
@@ -35,8 +36,8 @@ from flash_ansr.flash_ansr import Generation  # noqa: E402
 from flash_ansr.model.flash_ansr_model import FlashANSRModel  # noqa: E402
 from flash_ansr.preprocessing import PromptPrefix  # noqa: E402
 
-CONFIG = ROOT / "experimental/history_benefits/pilot.yaml"
-PILOT = ROOT / "runs/history_benefits/pilot"
+CONFIG = ROOT / "experiments/history_benefits/r1_pipeline_check/config.yaml"
+PILOT = ROOT / "runs/history_benefits/r1_pipeline_check"
 RESULTS = ROOT / "runs/T8vsT8-1"
 VALIDATION = list(range(160, 200))
 THRESHOLDS = (1e-3, 1e-6)

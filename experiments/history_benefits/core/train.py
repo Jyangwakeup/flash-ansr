@@ -110,7 +110,7 @@ def train(
     from (its weights, optimizer, RNG and sample position; the schedule is this call's);
     ``on_checkpoint(step)``: called after each checkpoint's validation.
 
-    ``batch_maker(step, rng) -> samples`` replaces the pool sampling (mix run): each sample
+    ``batch_maker(step, rng) -> samples`` replaces the pool sampling (round 3): each sample
     carries ``kind`` and a JSON-able ``info``; per-kind target CE is logged as ``ce_<kind>``.
     ``validator(step) -> dict`` (with a ``loss`` key) replaces the validation-set loss; it is
     then also the only use of ``val_ids`` (pools are loaded lazily, only for pool samples).

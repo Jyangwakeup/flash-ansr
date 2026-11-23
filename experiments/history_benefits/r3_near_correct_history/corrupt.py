@@ -1,4 +1,4 @@
-"""Near-correct histories: the true formula, slightly broken (mix run, 正式实验规则.md §12).
+"""Near-correct histories: the true formula, slightly broken (round 3, 0-实验规则.md §12).
 
 Levels (the requested level is drawn by the caller; what was actually done is recorded):
 

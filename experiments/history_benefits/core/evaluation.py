@@ -1,4 +1,5 @@
-"""Medium-scale evaluation (训练评估流程.md §6–§7; 正式实验规则.md §1–§2).
+"""Generation and scoring shared by every round (written for round 2: 0-训练评估流程.md §6–§7;
+0-实验规则.md §1–§2).
 
 Every candidate is scored on the support split (fNRR) and on the held-out split (vNRR), which
 never enters generation, fitting or ranking. Success: FVU <= float32 eps (srbf is_perfect_fit).
@@ -18,16 +19,6 @@ from common import eval_seed, fit_seed, history_ids, load_base, read_pool, read_
 from pool import fvu
 
 EPS32 = float(np.finfo(np.float32).eps)
-
-#: The six final-evaluation conditions (流程 §7.2): name -> (group, history source or None).
-CONDITIONS = {
-    "1_A_none": ("A", None),
-    "2_C_model": ("C", "model"),
-    "3_B_random": ("B", "random"),
-    "4_C_none": ("C", None),
-    "5_B_none": ("B", None),
-    "6_B_model": ("B", "model"),
-}
 
 
 def wrapper_for(cfg: Any, model: Any) -> Any:

@@ -1,5 +1,5 @@
-"""Medium-scale history-refinement run (rules: experiment-results/history-benefits/正式实验规则.md;
-procedure: 训练评估流程.md). Every stage resumes: a finished artifact is never rebuilt.
+"""Round 2 (r2_random_vs_model_history): A no history / B random history / C model history
+(rules: experiment-results/history_benefits/0-实验规则.md; procedure: 0-训练评估流程.md). Every stage resumes: a finished artifact is never rebuilt.
 
 Stages (independent ones may run as parallel processes):
 
@@ -15,27 +15,28 @@ Stages (independent ones may run as parallel processes):
     equal-time --condition NAME|original_T8  rerun at the time-matched budget (parallel is fine)
     self --condition NAME                  full pipeline, the model alone (规则 §2.3): NAME in
                                            SELF_CONDITIONS (added after the final results)
-    report                                 tables and the medium-scale report
+    report                                 tables and the round-2 report (<output>/报告.md)
 
 Timing caveat: stages that run in parallel contend for the CPU, so their seconds are only
 comparable within one stage; the equal-time stage measures its own timing and must run alone.
 """
 
+from pathlib import Path
 from typing import Any
 import argparse
 import json
-import subprocess
 import sys
 import time
 
 import torch
 import yaml
 
-from common import ROOT, dump, migrate, load_base, problem_ids, sha, source, worker_config
-from flash_ansr.model.flash_ansr_model import FlashANSRModel
-from pool import build
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))  # shared code: experiments/history_benefits/core
+from common import ROOT, dump, migrate, load_base, problem_ids, sha, source, worker_config  # noqa: E402
+from pool import build  # noqa: E402
+from run_support import jsonl_logger, load_checkpoint, load_step0, provenance  # noqa: E402
 
-CONFIG = "experimental/history_benefits/medium.yaml"
+CONFIG = "experiments/history_benefits/r2_random_vs_model_history/config.yaml"
 GROUP_SOURCE = {"A": "model", "B": "random", "C": "model"}  # A never uses its pool
 #: full-pipeline conditions: name -> (model, two_stage). "T8" is the frozen original model run
 #: through the same hand-written inference code as A/B/C.
@@ -46,51 +47,14 @@ SELF_CONDITIONS = {
 }
 
 
-def provenance(cfg: Any, out: Any, stage: Any) -> None:
-    """Record config, code version and file hashes of one stage (append-only)."""
-    git = lambda *a: subprocess.run(["git", *a], cwd=ROOT, capture_output=True, text=True).stdout  # noqa: E731
-    files = sorted((ROOT / "experiments/history_benefits").glob("*.py"))
-    record = dict(
-        stage=stage,
-        time=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        argv=sys.argv,
-        git_commit=git("rev-parse", "HEAD").strip(),
-        git_dirty=bool(git("status", "--porcelain").strip()),
-        hashes={str(p.relative_to(ROOT)): sha(p) for p in files},
-        torch=torch.__version__,
-        threads=torch.get_num_threads(),
-    )
-    with (out / "provenance.jsonl").open("a") as log:
-        log.write(json.dumps(record) + "\n")
-
-
-def load_step0(cfg: Any, out: Any) -> Any:
-    m = FlashANSRModel.from_config(json.loads((out / "model_config.json").read_text()))
-    m.load_state_dict(torch.load(out / "step0.pt", weights_only=True))
-    return m
-
-
-def load_checkpoint(m: Any, path: Any) -> Any:
-    m.load_state_dict(torch.load(path, map_location="cpu", weights_only=False)["model"])
-    return m
-
-
 def ids_of(cfg: Any) -> tuple[list[int], list[int]]:
     return (problem_ids(cfg, "train", cfg["train_problems"]),
             problem_ids(cfg, "validation", cfg["validation_problems"]))
 
 
-def jsonl_logger(path: Any) -> Any:
-    def log(row: Any) -> None:
-        with path.open("a") as f:
-            f.write(json.dumps(row, default=float) + "\n")
-        print(f"{path.parent.name}/{path.stem} pid={row['pid']}", flush=True)
-    return log
-
-
 def probe(cfg: Any, out: Any, m: Any, group: Any, folder: Any, step: Any) -> None:
     """Every-200-step probe (流程 §6): history off, and history on for B/C; probe_draws each."""
-    from medium_eval import run_condition, summarize
+    from evaluation import run_condition, summarize
 
     path = folder / f"probe_{step}.json"
     if path.exists():
@@ -210,7 +174,8 @@ def main() -> Any:
         # the main line's final step already got its probe during training (on_checkpoint)
         return
 
-    from medium_eval import CONDITIONS, run_condition, run_original, summarize
+    from evaluation import run_condition, run_original, summarize
+    from r2_conditions import CONDITIONS
 
     final = out / "final"
     final.mkdir(exist_ok=True)
@@ -287,7 +252,7 @@ def main() -> Any:
             cfg, out, m, ids, hist, n, phase0=True, log=log))
         return
     if args.stage == "self":
-        from medium_eval import run_self
+        from evaluation import run_self
 
         who, two = SELF_CONDITIONS[args.condition]
         if who == "T8":
@@ -298,7 +263,7 @@ def main() -> Any:
         run_rows(args.condition, lambda ids, log: run_self(cfg, out, model, ids, two, log=log))
         return
     if args.stage == "report":
-        from medium_report import report
+        from r2_report import report
         report(cfg, out)
         return
 

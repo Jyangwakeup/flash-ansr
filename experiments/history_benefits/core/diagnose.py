@@ -8,12 +8,12 @@ b) Near-correct histories built from the true formula -- exact, constants x1.3, 
    ``t8_candidate``: the history the evaluation would give (one of the first history_top of the
    stored T8 model pool, chosen by the eval seed), for comparison with the made-up ones.
 
-    python experiments/history_benefits/diagnose.py [--groups B C] [--n 100] [--draws 50]
-    python experiments/history_benefits/diagnose.py --config experimental/history_benefits/mix.yaml \
-        --groups C --selected        # the mix run: its pre-registered selected checkpoint
+    python experiments/history_benefits/core/diagnose.py [--groups B C] [--n 100] [--draws 50]
+    python experiments/history_benefits/core/diagnose.py --config experiments/history_benefits/r3_near_correct_history/config.yaml \
+        --groups C --selected        # round 3: its pre-registered selected checkpoint
 
 Results: <output>/diagnostics/history_use.json (and printed). Not part of the locked rules: a
-diagnostic added after the medium results.
+diagnostic added after the round-2 results.
 """
 
 from typing import Any
@@ -28,8 +28,8 @@ from flash_ansr.inference import evaluate_prefix
 from flash_ansr.data.streaming import build_training_sample
 
 from common import ROOT, collate, dump, history_ids, loss, problem_ids, read_problem, source, worker_config
-from medium import load_checkpoint, load_step0
-from medium_eval import EPS32, choose_history, generate, outcome, wrapper_for
+from run_support import load_checkpoint, load_step0
+from evaluation import EPS32, choose_history, generate, outcome, wrapper_for
 from common import read_pool
 
 
@@ -82,12 +82,12 @@ def target_ce(model: Any, s: Any) -> tuple[float, list]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="experimental/history_benefits/medium.yaml")
+    parser.add_argument("--config", default="experiments/history_benefits/r2_random_vs_model_history/config.yaml")
     parser.add_argument("--groups", nargs="+", default=["B", "C"])
     parser.add_argument("--n", type=int, default=100)
     parser.add_argument("--draws", type=int, default=50)
     parser.add_argument("--selected", action="store_true",
-                        help="use train/<group>/selected.json (mix run) instead of the cooldown step")
+                        help="use train/<group>/selected.json (round 3) instead of the cooldown step")
     args = parser.parse_args()
     cfg = yaml.safe_load((ROOT / args.config).read_text())
     torch.set_num_threads(cfg["threads"])

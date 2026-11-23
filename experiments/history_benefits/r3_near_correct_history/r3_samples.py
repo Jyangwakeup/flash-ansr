@@ -1,4 +1,4 @@
-"""Mixed training batches and the checkpoint-selection loss of the mix run (正式实验规则.md §12).
+"""Mixed training batches and the checkpoint-selection loss of round 3 (0-实验规则.md §12).
 
 Sample kinds (fractions per group in ``cfg["mix"]``):
 

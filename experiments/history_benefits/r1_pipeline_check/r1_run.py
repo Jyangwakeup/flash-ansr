@@ -1,5 +1,6 @@
-"""Run the gated CPU engineering pilot; never starts the formal experiment."""
+"""Round 1 (r1_pipeline_check): the gated CPU engineering pilot; never starts the formal experiment."""
 
+from pathlib import Path
 from typing import Any
 import argparse
 import json
@@ -8,7 +9,8 @@ import sys
 from importlib.metadata import version as package_version
 import torch
 import yaml
-from common import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))  # shared code: experiments/history_benefits/core
+from common import (  # noqa: E402
     ROOT,
     dump,
     sha,
@@ -22,17 +24,17 @@ from common import (
     collate,
     loss,
 )
-from flash_ansr.model.flash_ansr_model import FlashANSRModel
-from pool import build
-from checks import check
-from train import train
-from evaluate import evaluate
+from flash_ansr.model.flash_ansr_model import FlashANSRModel  # noqa: E402
+from pool import build  # noqa: E402
+from checks import check  # noqa: E402
+from train import train  # noqa: E402
+from evaluate import evaluate  # noqa: E402
 
 
 def main() -> Any:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=["small", "pilot", "costs", "all"])
-    parser.add_argument("--config", default="experimental/history_benefits/pilot.yaml")
+    parser.add_argument("--config", default="experiments/history_benefits/r1_pipeline_check/config.yaml")
     args = parser.parse_args()
     cfg = yaml.safe_load((ROOT / args.config).read_text())
     torch.set_num_threads(cfg["threads"])
@@ -194,10 +196,10 @@ if __name__ == "__main__":
         config_path = (
             sys.argv[sys.argv.index("--config") + 1]
             if "--config" in sys.argv
-            else "experimental/history_benefits/pilot.yaml"
+            else "experiments/history_benefits/r1_pipeline_check/config.yaml"
         )
         config = yaml.safe_load((ROOT / config_path).read_text())
-        from report import report
+        from r1_report import report
 
         report(config, ROOT / config["output"], error=f"{type(exc).__name__}: {exc}")
         raise
@@ -205,9 +207,9 @@ if __name__ == "__main__":
         config_path = (
             sys.argv[sys.argv.index("--config") + 1]
             if "--config" in sys.argv
-            else "experimental/history_benefits/pilot.yaml"
+            else "experiments/history_benefits/r1_pipeline_check/config.yaml"
         )
         config = yaml.safe_load((ROOT / config_path).read_text())
-        from report import report
+        from r1_report import report
 
         report(config, ROOT / config["output"])

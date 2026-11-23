@@ -1,8 +1,10 @@
+# Round 2 (r2_random_vs_model_history): A no history / B random history / C model history.
 version: 1
 model: models/psaegert/flash-ansr-v25.0-T8-3M
 recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
 train_recipe: configs/v25.0-T8.1-3M/train.yaml
-output: runs/history_benefits/medium
+output: runs/history_benefits/r2_random_vs_model_history
+wandb_group: r2_random_vs_model_history   # W&B group; run names get the "r2" prefix
 # seed: the shared step-0 initialization only; every other stream has its own seed below.
 seed: 20261120
 data_seed_train: 20261121

@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
-# Medium-scale pipeline (训练评估流程.md). Start it inside tmux:
+# Round 2 (r2_random_vs_model_history) pipeline (0-训练评估流程.md). Start it inside tmux:
 #
-#   experiments/history_benefits/run_medium.sh start     # opens tmux session "history"
-#   tmux attach -t history                               # watch; Ctrl-b d to detach
+#   experiments/history_benefits/r2_random_vs_model_history/r2_run.sh start     # opens tmux session "r2"
+#   tmux attach -t r2                                    # watch; Ctrl-b d to detach
 #
 # Every stage resumes, so re-running after an interruption continues where it stopped.
 # Parallel lanes: A/B/C train at once; final evaluations and equal-time reruns run in 3 lanes.
 # The equal-time measurement runs alone (its timings set the budget).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-CONFIG="${CONFIG:-experimental/history_benefits/medium.yaml}"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+CONFIG="${CONFIG:-experiments/history_benefits/r2_random_vs_model_history/config.yaml}"
 OUT="$ROOT/$(grep '^output:' "$ROOT/$CONFIG" | awk '{print $2}')"
 LOGS="$OUT/logs"
 PY="$ROOT/.venv/bin/python"
-SESSION="${SESSION:-history}"
+SESSION="${SESSION:-r2}"
 
 if [[ "${1:-}" == "start" ]]; then
   mkdir -p "$LOGS"
   tmux new-session -d -s "$SESSION" -n pipeline -c "$ROOT" \
     "CONFIG=$CONFIG caffeinate -ims $0 run 2>&1 | tee -a $LOGS/pipeline.log; echo 'pipeline finished'; exec bash"
   tmux new-window -t "$SESSION" -n logs -c "$LOGS" \
-    "sleep 2; tail -n 3 -F $LOGS/*.log $ROOT/runs/medium_pools_*.log 2>/dev/null"
+    "sleep 2; tail -n 3 -F $LOGS/*.log 2>/dev/null"
   tmux new-window -t "$SESSION" -n shell -c "$ROOT"
   echo "started tmux session '$SESSION' (tmux attach -t $SESSION)"
   exit 0
 fi
 
 mkdir -p "$LOGS"
-cd "$ROOT/experiments/history_benefits"
+cd "$ROOT/experiments/history_benefits/r2_random_vs_model_history"
 stage() {  # stage <log-name> <args...>
   local name="$1"; shift
   echo "$(date '+%F %T') start $name"
-  "$PY" medium.py --config "$CONFIG" "$@" >>"$LOGS/$name.log" 2>&1
+  "$PY" r2_run.py --config "$CONFIG" "$@" >>"$LOGS/$name.log" 2>&1
   echo "$(date '+%F %T') done  $name"
 }
 lane() { for job in "$@"; do eval "$job"; done; }

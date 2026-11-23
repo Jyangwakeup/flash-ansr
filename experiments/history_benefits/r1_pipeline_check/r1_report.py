@@ -5,7 +5,6 @@ import json
 import re
 from datetime import datetime, timezone
 from statistics import mean, median
-from common import ROOT
 
 
 def report(cfg: Any, out: Any, error: Any = None) -> Any:
@@ -26,7 +25,7 @@ def report(cfg: Any, out: Any, error: Any = None) -> Any:
         status,
         "",
         "这是工程正确性与 CPU 成本检查，不用于判断历史精修是否优于独立采样。",
-        f'配置：`experimental/history_benefits/pilot.yaml`；原始产物：`{cfg["output"]}/`。',
+        f'配置：`experiments/history_benefits/r1_pipeline_check/config.yaml`；原始产物：`{cfg["output"]}/`。',
         f'报告更新时间：{datetime.now(timezone.utc).isoformat(timespec="seconds")}。',
         "",
     ]
@@ -272,7 +271,7 @@ def report(cfg: Any, out: Any, error: Any = None) -> Any:
 
 ### 第 40 题：已经定位数值失败路径，尚未修复根因
 
-这里的“第 40 题”指 `problem_id=40`。题目本身保存在 `runs/history_benefits/pilot/problems/40.json` 和 `40.npz`；两个空池记录在 `pools/model/40.json`、`pools/random/40.json`。题目未删除、未替换，训练选到空池时回退 K=0。
+这里的“第 40 题”指 `problem_id=40`。题目本身保存在 `runs/history_benefits/r1_pipeline_check/problems/40.json` 和 `40.npz`；两个空池记录在 `pools/model/40.json`、`pools/random/40.json`。题目未删除、未替换，训练选到空池时回退 K=0。
 
 它的正确公式为：
 
@@ -349,7 +348,7 @@ y = x3 + x11 * (sinh(-x15 * (x15 + x7 - x11)) - acosh(x3)) / (x15 * x7) - x1 - x
         "训练调度、配置混用拒绝和验证条件核对分别见 `training_audit.json`、`manifest_guard_check.json`、`evaluation_audit.json`。运行期间仅修复和整理代码，具体版本及语义核对记录在各 provenance 文件和 `code_before_format/` 中。",
         "",
     ]
-    target = ROOT / "experiment-results/history-benefits/试跑报告.md"
+    target = out / "报告.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(lines))
     return target

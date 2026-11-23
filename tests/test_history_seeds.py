@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments" / "history_benefits"))
+HB = Path(__file__).resolve().parents[1] / "experiments" / "history_benefits"
+sys.path.insert(0, str(HB / "core"))
+sys.path.insert(0, str(HB / "r3_near_correct_history"))  # r3_samples, corrupt
 
 from common import eval_seed, fit_seed, problem_ids, split_seeds, train_seed  # noqa: E402
 from pool import draw_problems, split_of  # noqa: E402
@@ -67,7 +69,7 @@ def test_ids_and_seeds():
         split_seeds({"data_seed_train": 1})
 
 
-# --- mix run: selection / fresh splits and near-correct histories --------------------------
+# --- round 3: selection / fresh splits and near-correct histories --------------------------
 
 from common import SELECTION_ID_OFFSET  # noqa: E402
 
@@ -92,7 +94,7 @@ def test_extra_seed_keys_do_not_change_old_splits():
 
 
 def test_kind_counts():
-    from mix_samples import kind_counts
+    from r3_samples import kind_counts
 
     assert kind_counts({"none": 0.3, "near": 0.4, "real": 0.3}, 128) == {"none": 39, "near": 51, "real": 38}
     assert kind_counts({"none": 1.0}, 16) == {"none": 16, "near": 0, "real": 0}

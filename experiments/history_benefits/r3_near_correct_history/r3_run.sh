@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Near-correct-history small-scale run (正式实验规则.md §12). Start it inside tmux:
+# Round 3 (r3_near_correct_history) run (0-实验规则.md §12). Start it inside tmux:
 #
-#   experiments/history_benefits/run_mix.sh start      # opens tmux session "mix"
-#   tmux attach -t mix                                  # watch; Ctrl-b d to detach
+#   experiments/history_benefits/r3_near_correct_history/r3_run.sh start      # opens tmux session "r3"
+#   tmux attach -t r3                                   # watch; Ctrl-b d to detach
 #
 # Every stage resumes, so re-running after an interruption continues where it stopped.
 # Order: link -> pools (3 lanes + selection) -> A and C train in parallel -> select ->
 #        full-pipeline evaluation (2 lanes) + diagnostic -> report.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-CONFIG="${CONFIG:-experimental/history_benefits/mix.yaml}"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+CONFIG="${CONFIG:-experiments/history_benefits/r3_near_correct_history/config.yaml}"
 OUT="$ROOT/$(grep '^output:' "$ROOT/$CONFIG" | awk '{print $2}')"
 LOGS="$OUT/logs"
 PY="$ROOT/.venv/bin/python"
-SESSION="${SESSION:-mix}"
+SESSION="${SESSION:-r3}"
 
 if [[ "${1:-}" == "start" ]]; then
   mkdir -p "$LOGS"
@@ -27,11 +27,11 @@ if [[ "${1:-}" == "start" ]]; then
 fi
 
 mkdir -p "$LOGS"
-cd "$ROOT/experiments/history_benefits"
+cd "$ROOT/experiments/history_benefits/r3_near_correct_history"
 stage() {  # stage <log-name> <args...>
   local name="$1"; shift
   echo "$(date '+%F %T') start $name"
-  "$PY" -W ignore::RuntimeWarning mix_run.py --config "$CONFIG" "$@" >>"$LOGS/$name.log" 2>&1
+  "$PY" -W ignore::RuntimeWarning r3_run.py --config "$CONFIG" "$@" >>"$LOGS/$name.log" 2>&1
   echo "$(date '+%F %T') done  $name"
 }
 lane() { for job in "$@"; do eval "$job"; done; }

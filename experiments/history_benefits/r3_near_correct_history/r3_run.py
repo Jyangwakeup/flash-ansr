@@ -1,9 +1,9 @@
 """Near-correct-history small-scale run: A (no history) vs C (30% none / 40% near-correct /
-30% real T8 candidates), 2,000 steps each (rules: 正式实验规则.md §12; procedure:
-训练评估流程.md "近似历史小规模验证"). Every stage resumes.
+30% real T8 candidates), 2,000 steps each (rules: 0-实验规则.md §12; procedure:
+0-训练评估流程.md "第 3 轮：近似正确历史"). Every stage resumes.
 
     link                         problems 0..999 + validation problems, their model pools and
-                                 step-0 from the medium run (hard links; re-drawn and compared)
+                                 step-0 from the round-2 run (hard links; re-drawn and compared)
     pools-train [--part i/n]     model pools of the new training problems (1000..4999)
     pools-selection              problems + model pools of the checkpoint-selection set
     pools-check                  every pool present -> pools_complete.json
@@ -14,6 +14,7 @@
     report                       tables -> runs/.../报告.md (+ W&B)
 """
 
+from pathlib import Path
 from typing import Any
 import argparse
 import json
@@ -26,10 +27,11 @@ import time
 import torch
 import yaml
 
-from common import ROOT, dump, problem_ids, read_problem, sha, source, worker_config
-from medium import jsonl_logger, load_checkpoint, load_step0, provenance
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))  # shared code: experiments/history_benefits/core
+from common import ROOT, dump, problem_ids, read_problem, sha, source, worker_config  # noqa: E402
+from run_support import jsonl_logger, load_checkpoint, load_step0, provenance  # noqa: E402
 
-CONFIG = "experimental/history_benefits/mix.yaml"
+CONFIG = "experiments/history_benefits/r3_near_correct_history/config.yaml"
 SELF_CONDITIONS = {"self_C_two": ("C", True), "self_C_direct": ("C", False), "self_A_direct": ("A", False)}
 
 
@@ -47,7 +49,7 @@ def link_file(src: Any, dst: Any) -> None:
 
 
 def link(cfg: Any, out: Any) -> None:
-    """Reuse the medium run's problems, pools and start; verify they are what the seeds give."""
+    """Reuse the round-2 run's problems, pools and start; verify they are what the seeds give."""
     from pool import draw_problems
 
     reuse = ROOT / cfg["reuse"]
@@ -67,7 +69,7 @@ def link(cfg: Any, out: Any) -> None:
     manifest = json.loads((reuse / "start_manifest.json").read_text())
     for name, digest in manifest.items():
         if sha(out / name) != digest:
-            raise ValueError(f"{name} differs from the medium run's start")
+            raise ValueError(f"{name} differs from the round-2 run's start")
     dump(out / "start_manifest.json", manifest)
     # the seeds must reproduce the linked problems (prefix-stable streams)
     checked = {}
@@ -131,7 +133,7 @@ def main() -> Any:
     m = load_step0(cfg, out)
 
     if args.stage == "train":
-        from mix_samples import MixSampler, selection_loss, selection_set
+        from r3_samples import MixSampler, selection_loss, selection_set
         from train import train, warmup_constant
         from wb import Run
 
@@ -186,7 +188,7 @@ def main() -> Any:
         return
 
     if args.stage == "self":
-        from medium_eval import run_self, summarize
+        from evaluation import run_self, summarize
         from wb import Run
 
         who, two = SELF_CONDITIONS[args.condition]
@@ -224,14 +226,14 @@ def main() -> Any:
     if args.stage == "diagnose":
         if (out / "diagnostics" / "history_use.json").exists():
             return
-        subprocess.run([sys.executable, str(ROOT / "experiments/history_benefits/diagnose.py"),
+        subprocess.run([sys.executable, str(ROOT / "experiments/history_benefits/core/diagnose.py"),
                         "--config", args.config, "--groups", "C", "--selected",
                         "--n", str(cfg["diagnose_problems"]), "--draws", str(cfg["diagnose_draws"])],
-                       check=True, cwd=ROOT / "experiments/history_benefits")
+                       check=True, cwd=ROOT / "experiments/history_benefits/core")
         return
 
     if args.stage == "report":
-        from mix_report import report
+        from r3_report import report
 
         report(cfg, out)
         return

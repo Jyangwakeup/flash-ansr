@@ -1,4 +1,4 @@
-"""History ablation on the validation set (exploratory; 正式实验规则.md §12.7).
+"""History ablation on the validation set (exploratory; 0-实验规则.md §12.7).
 
 The history has two parts: the formula (tokens in the sequence) and its predictions on the
 support points (data column 18). For each history sample of the validation set (ids 200000..)
@@ -14,13 +14,15 @@ History samples: every validation problem once per near-correct level (exact, co
 structure_1, structure_2_3) and once with a real T8 candidate (grouped by its support FVU).
 Target cross-entropy only (forward passes, no generation).
 
-    python experiments/history_benefits/ablate.py --checkpoint runs/history_benefits/mix/train/C/checkpoint_1500.pt
-    python experiments/history_benefits/ablate.py --selected      # train/C/selected.json
+    python experiments/history_benefits/r3_near_correct_history/ablate.py --checkpoint runs/history_benefits/r3_near_correct_history/train/C/checkpoint_1500.pt
+    python experiments/history_benefits/r3_near_correct_history/ablate.py --selected      # train/C/selected.json
 
 Results: <output>/ablation/<checkpoint name>.json (+ W&B).
 """
 
+from pathlib import Path
 from typing import Any
+import sys
 import argparse
 import json
 
@@ -28,10 +30,11 @@ import numpy as np
 import torch
 import yaml
 
-from common import ROOT, collate, dump, eval_seed, loss, problem_ids, source, worker_config
-from corrupt import LEVELS
-from medium import load_checkpoint, load_step0
-from mix_samples import MixSampler
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))  # shared code: experiments/history_benefits/core
+from common import ROOT, collate, dump, eval_seed, loss, problem_ids, source, worker_config  # noqa: E402
+from corrupt import LEVELS  # noqa: E402
+from run_support import load_checkpoint, load_step0  # noqa: E402
+from r3_samples import MixSampler  # noqa: E402
 
 CONDITIONS = ("none", "full", "tokens_only", "mismatched", "perfect")
 FVU_BINS = ((0.0, 1e-3, "real fvu<1e-3"), (1e-3, 0.1, "real fvu 1e-3–0.1"), (0.1, float("inf"), "real fvu≥0.1"))
@@ -76,7 +79,7 @@ def labels_of(model: Any, s: Any) -> list:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="experimental/history_benefits/mix.yaml")
+    parser.add_argument("--config", default="experiments/history_benefits/r3_near_correct_history/config.yaml")
     parser.add_argument("--checkpoint", help="path relative to the repo root")
     parser.add_argument("--selected", action="store_true", help="the pre-registered selected C checkpoint")
     parser.add_argument("--group", default="C")

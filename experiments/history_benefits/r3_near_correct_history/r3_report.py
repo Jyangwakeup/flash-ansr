@@ -1,6 +1,6 @@
-"""Tables of the mix run (正式实验规则.md §12) -> <output>/报告.md, and to W&B.
+"""Tables of round 3 (0-实验规则.md §12) -> <output>/报告.md, and to W&B.
 
-The written analysis goes to experiment-results/history-benefits/近似历史小规模报告.md (by hand,
+The written analysis goes to experiment-results/history_benefits/3-近似正确历史报告.md (by hand,
 from these tables). Medium-run results on the same 200 problems with the same eval seeds are
 paired in as references.
 """
@@ -12,14 +12,14 @@ from collections import Counter
 import numpy as np
 
 from common import ROOT, train_seed
-from medium_report import paired, solved
+from stats import paired, solved
 
 CONDITION_LABELS = {
     "self_C_two": "C 两阶段（自己先 300，再带历史 700）",
     "self_C_direct": "C 直接生成 1000",
     "self_A_direct": "A 直接生成 1000",
 }
-MEDIUM_REFS = {
+R2_REFS = {
     "self_T8_direct": "原 T8 直接生成 1000（同代码，上一轮）",
     "self_A_direct": "上一轮 A 直接生成 1000",
     "self_C_two": "上一轮 C 两阶段",
@@ -28,15 +28,15 @@ COMPARISONS = [
     ("self_C_two", "self_C_direct", "精修有没有用：C 两阶段 − C 直接"),
     ("self_C_two", "self_A_direct", "C 方案整体 − A"),
     ("self_C_direct", "self_A_direct", "C 不用历史时 − A（混合训练有没有伤直接生成）"),
-    ("self_A_direct", "medium:self_T8_direct", "A − 原 T8"),
-    ("self_C_two", "medium:self_T8_direct", "C 两阶段 − 原 T8"),
-    ("self_A_direct", "medium:self_A_direct", "这轮 A − 上一轮 A（少重复用题的效果）"),
-    ("self_C_two", "medium:self_C_two", "这轮 C 两阶段 − 上一轮 C 两阶段"),
+    ("self_A_direct", "r2:self_T8_direct", "A − 原 T8"),
+    ("self_C_two", "r2:self_T8_direct", "C 两阶段 − 原 T8"),
+    ("self_A_direct", "r2:self_A_direct", "这轮 A − 上一轮 A（少重复用题的效果）"),
+    ("self_C_two", "r2:self_C_two", "这轮 C 两阶段 − 上一轮 C 两阶段"),
 ]
 
 
 def rows_of(out: Any, cfg: Any, name: str) -> Any:
-    if name.startswith("medium:"):
+    if name.startswith("r2:"):
         path = ROOT / cfg["reuse"] / "final" / f"{name.split(':', 1)[1]}.json"
     else:
         path = out / "final" / f"{name}.json"
@@ -103,8 +103,8 @@ def ablation_tables(out: Any) -> list:
 
 
 def report(cfg: Any, out: Any) -> None:
-    lines = ["# 近似历史小规模验证：自动表格", "",
-             f"配置：`{cfg['output']}/config.yaml`；规则：正式实验规则.md §12。题数小时请看置信区间。", ""]
+    lines = ["# 第 3 轮：近似正确历史（自动表格）", "",
+             f"配置：`{cfg['output']}/config.yaml`；规则：0-实验规则.md §12。题数小时请看置信区间。", ""]
     summary: dict = {}
 
     # -- training: selected checkpoint, selection loss per checkpoint ----------------------
@@ -158,7 +158,7 @@ def report(cfg: Any, out: Any) -> None:
     lines += ["## 完整流程评测（开发集 = 题号 100000 起的 200 道，代码里叫 validation）", "",
               "| 条件 | 题数 | vNRR（主指标） | fNRR | Oracle | 平均秒/题 |", "|---|---|---|---|---|---|"]
     table = []
-    for name, label in [*CONDITION_LABELS.items(), *((f"medium:{k}", v) for k, v in MEDIUM_REFS.items())]:
+    for name, label in [*CONDITION_LABELS.items(), *((f"r2:{k}", v) for k, v in R2_REFS.items())]:
         rows = rows_of(out, cfg, name)
         if not rows:
             continue
@@ -166,7 +166,7 @@ def report(cfg: Any, out: Any) -> None:
                float(np.mean([r["seconds_total"] for r in rows]))]
         table.append(rec)
         lines.append(f"| {rec[0]} | {rec[1]} | {pct(rec[2])} | {pct(rec[3])} | {pct(rec[4])} | {rec[5]:.1f} |")
-        if not name.startswith("medium:"):
+        if not name.startswith("r2:"):
             summary[f"{name}/vNRR"] = rec[2]
     lines += ["", "## 配对比较（vNRR 差值，同题配对，bootstrap 10,000 次，95% 置信区间）", "",
               "| 比较 | 题数 | 差值 | 95% 区间 |", "|---|---|---|---|"]

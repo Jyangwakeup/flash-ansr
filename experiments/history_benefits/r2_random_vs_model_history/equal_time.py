@@ -1,4 +1,4 @@
-"""Equal-time budget (正式实验规则.md §2.2). RUN ALONE: these timings decide the budget.
+"""Equal-time budget (0-实验规则.md §2.2). RUN ALONE: these timings decide the budget.
 
 On the first ``n`` validation problems, time (encoding + history choice + generation + fitting):
 
@@ -19,13 +19,14 @@ import time
 import numpy as np
 
 from common import dump
-from medium_eval import CONDITIONS, run_condition, run_original
+from evaluation import run_condition, run_original
+from r2_conditions import CONDITIONS
 
 N_TIMED = 20
 
 
 def measure(cfg: Any, out: Any, m: Any, val_ids: Any) -> None:
-    from medium import load_checkpoint
+    from run_support import load_checkpoint
 
     path = out / "equal_time_budget.json"
     if path.exists():
