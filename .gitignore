@@ -198,3 +198,6 @@ experiment-results/
 
 # Claude Code session lock (machine-local)
 .claude/scheduled_tasks.lock
+
+# Local reference papers
+docs/*.pdf
