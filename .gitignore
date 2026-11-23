@@ -195,3 +195,6 @@ experiment-results/
 # macOS Finder files and local scratch
 .DS_Store
 /tmp/
+
+# Claude Code session lock (machine-local)
+.claude/scheduled_tasks.lock

@@ -47,9 +47,11 @@ One experiment runs in rounds. Example layout (`history_benefits`; details in `e
 | Shared code (keep it stable) | `experiments/history_benefits/core/` |
 | Round 2: its config, smoke config and scripts | `experiments/history_benefits/r2_random_vs_model_history/` (`config.yaml`, `smoke.yaml`, `r2_*.py`) |
 | Round 2 outputs | `runs/history_benefits/r2_random_vs_model_history/` |
-| Round 2 report | `experiment-results/history_benefits/2-随机历史vs模型历史报告.md` |
+| Round 2 design, pre-registration and report | `experiment-results/history_benefits/r2_random_vs_model_history/` (`设计与预注册.md`, `报告.md`) |
+| Documents shared by all rounds | `experiment-results/history_benefits/0_共用/`; index in `experiment-results/history_benefits/README.md` |
 
-- Name a round `r<N>_<what it tests>`, numbered in the order the rounds ran, so the name alone says what it does. Never use names like `pilot`, `medium`, `mix`. Use the same name for the code folder, the run folder, `wandb_group`, the report (`<N>-<中文名>.md`) and the tag (`hb/r<N>-...`).
+- Name a round `r<N>_<what it tests>`, numbered in the order the rounds ran, so the name alone says what it does. Never use names like `pilot`, `medium`, `mix`. Use the same name for the code folder, the run folder, `wandb_group`, the report folder (`experiment-results/<name>/r<N>_.../`) and the tag (`hb/r<N>-...`).
+- Each round's report folder holds `设计与预注册.md` (written and locked before the formal run) and `报告.md` (the analysis after it). Rules shared by all rounds stay in `0_共用/`; never move a round's pre-registered text into another round's file.
 - A round imports only `core/` and its own folder, never another round. Prefix its scripts with `r<N>_` (mypy and W&B job types need unique file names).
 - Prefer changing only the round's config. A new way of building training samples goes in the round's folder, plugged in through `train(..., batch_maker=..., validator=...)`. A new model input structure goes in `src/flash_ansr/model/`, behind a model-config switch whose default keeps the old behaviour.
 - Code writes generated tables only into `runs/`. Hand-written reports live in `experiment-results/`, and no script overwrites them.
@@ -63,4 +65,4 @@ One experiment runs in rounds. Example layout (`history_benefits`; details in `e
 
 - Always reply in Chinese. Keep only code, file names and commands in their original form.
 - Use plain words. Lead with a concrete example (a table with numbers, an analogy), then name the term if needed. Explain any technical term right after you use it.
-- Write analysis reports in Chinese with tables. Give a one-sentence conclusion first. State plainly when the sample is too small to support a conclusion.
+- Before writing or revising any analysis report, use the `good-report` skill: every conclusion traces data → reason → conclusion with numbers.
