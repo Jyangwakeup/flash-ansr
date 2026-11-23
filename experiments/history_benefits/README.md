@@ -1,6 +1,6 @@
 # history_benefits：代码结构
 
-几轮共用的主代码放在 `core/`，每一轮的代码各自一个文件夹。报告和总目录在 `experiment-results/history_benefits/README.md`。
+几轮共用的主代码放在 `core/`，每一轮的代码各自一个文件夹。设计、预注册和报告在 `experiment-results/history_benefits/`：每轮一个同名目录，总目录是那里的 `README.md`。
 
 ```
 core/                           共用主代码，尽量不改
@@ -34,7 +34,7 @@ CONFIG=experiments/history_benefits/r3_near_correct_history/smoke.yaml SESSION=r
 ## 新开一轮
 
 1. 新建文件夹 `r<N>_<做什么>/`，名字要让人一眼看出这一轮在比什么，例如 `r4_two_history_slots`。
-2. 配置里写 `output: runs/history_benefits/r<N>_<做什么>` 和 `wandb_group: r<N>_<做什么>`。报告叫 `experiment-results/history_benefits/<N>-<做什么>.md`，这一轮结束时打标签 `hb/r<N>-<做什么>`。
+2. 配置里写 `output: runs/history_benefits/r<N>_<做什么>` 和 `wandb_group: r<N>_<做什么>`。设计与预注册写在 `experiment-results/history_benefits/r<N>_<做什么>/设计与预注册.md`（开跑前锁定），报告写在同一目录的 `报告.md`，这一轮结束时打标签 `hb/r<N>-<做什么>`。
 3. 每一轮只 import `core/` 和自己文件夹里的模块，**不 import 别的轮次**。入口脚本开头加一行：
    `sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))`
 4. 文件名加 `r<N>_` 前缀（`r4_run.py`、`r4_report.py`），这样 W&B 的 job_type 和 mypy 都能分清是哪一轮。
