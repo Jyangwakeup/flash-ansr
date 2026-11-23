@@ -48,3 +48,13 @@ CONFIG=experiments/history_benefits/r3_near_correct_history/smoke.yaml SESSION=r
 | 怎么评测、出什么报告 | 第 3 轮的消融、照抄率表 | 本轮文件夹里的 `r<N>_report.py`、`ablate.py` 等 | 不动 |
 | 模型的输入结构 | 历史位置数、历史怎么编码 | 改模型库 `src/flash_ansr/model/`，新结构放在模型配置开关后面（像已有的 `history_slots`），默认保持旧行为；本轮的 config 打开开关 | 一般不动 |
 | core 确实缺一个通用功能 | 新的数据划分、新的训练接口 | 改 core，新行为放在默认关闭的配置开关后面；改完把每一轮的 `smoke.yaml` 都跑一遍 | 少量改，要验证 |
+
+## 什么时候换成统一训练器
+
+现在先用 `core/train.py`。遇到下面任意一条，就先在 `src/` 里写统一训练器，再开新的一轮：
+
+1. 这一轮要上 GPU（`core/train.py` 只能跑 CPU，样本在主进程里一条一条造）。
+2. 这一轮要改 `collate`（多条历史、历史不再是数据第 19 列等，`common.collate` 写死了 19 列）。
+3. 模型明显变大，或者单轮训练超过一天。
+
+到时候的设计和验收标准见 [`design/HISTORY_TRAINER.md`](../../design/HISTORY_TRAINER.md)。
