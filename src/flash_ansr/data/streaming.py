@@ -366,6 +366,549 @@ class SharedMemoryWorkerPool:
         self._available_slots_queue.put(slot_idx)
 
 
+def build_training_sample(
+    problem: Any, worker_config: WorkerConfig, catalog: Any,
+    worker_rng: np.random.Generator, noise_spec: Any = None,
+    *, strict_length: bool = False, history_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Construct one sample with the SAME task recipe used by streaming workers.
+
+    Returns a rejection record for nonfinite targets or legacy truncation. Offline callers must
+    record rejection, not silently replace the problem. row_indices tracks held-out points.
+    """
+    tokenizer = worker_config.tokenizer
+    padding = worker_config.padding
+    max_seq_len = worker_config.max_seq_len
+    tokenizer_oov = worker_config.tokenizer_oov
+    unconditional_prob = worker_config.unconditional_prob
+    simplipy_engine = catalog.simplipy_engine
+    variables = catalog.variables
+    masked_constant_id = int(tokenizer[MASKED_CONSTANT_TOKEN]) if MASKED_CONSTANT_TOKEN in tokenizer else -1
+    bos_token_id, eos_token_id = tokenizer["<bos>"], tokenizer["<eos>"]
+    has_expression_wrappers = "<expression>" in tokenizer and "</expression>" in tokenizer
+    ieee754_start_id, ieee754_end_id = int(tokenizer[IEEE754_START_TOKEN]), int(tokenizer[IEEE754_END_TOKEN])
+    tagged_targets = worker_config.target_dialect == TARGET_DIALECT_TAGGED
+    # The tagged canonicalization runs in the catalog's CONFIGURED target canon
+    # (owner ruling 2026-08-31): a corpus whose prefix targets are permissive-canonical
+    # is permissive-canonical in the tagged dialect too. Catalogs without the knob
+    # (curated pools) resolve to None = the engine's default mode, the historical call.
+    tagged_canon_mode = _tagged_canonical_mode(catalog)
+    complexity_cfg, mask_cfg = worker_config.complexity_block, worker_config.mask_block
+    predict_y_cfg, residual_cfg = worker_config.predict_y_block, worker_config.residual_block
+    task_blocks_on = any(c is not None for c in (complexity_cfg, mask_cfg, predict_y_cfg, residual_cfg))
+    n_skipped_task_blocks = 0
+    x_support = problem.x_support.copy()
+    row_indices = np.arange(len(x_support))
+    y_support = problem.y_support
+    # The encoder fits what a model would OBSERVE: the noisy targets (identical
+    # to the clean ones whenever the source ran without a noise spec). The clean
+    # y_support stays local for tasks that must not learn the noise.
+    y_encoder = problem.y_support_noisy
+    outlier_mask = problem.outlier_mask_support
+
+    # symbolic-data >= 0.14: generative catalogs yield CONCRETE expressions
+    # (literal values inside the tokens, ``problem.constants`` empty); masking
+    # is downstream policy. Reconstruct the training contract here: the
+    # concrete expression, and the positionally masked skeleton with the
+    # extracted values aligned 1:1 to its '<constant>' placeholders (the
+    # alignment the numeric head trains on). Placeholder-style problems
+    # (curated pools) still substitute their carried constants first, so both
+    # problem shapes take the same path.
+    expression = substitute_constants(
+        list(problem.skeleton), values=list(problem.constants), inplace=False)
+    if tagged_targets:
+        # The tagged canonical differs STRUCTURALLY from the prefix canonical
+        # (rational literal spellings, negative exponents absorbed into pow,
+        # negation distributed into <sub> sections) -- see
+        # symbolic_data.token_ops.tagged_canonical. np.pi/np.e stay symbolic
+        # tokens; every NUMERIC literal is extracted for ieee754 serialization.
+        try:
+            target_expression = tagged_canonical(
+                simplipy_engine, expression, mode=tagged_canon_mode)
+            skeleton, literal_values = mask_literals_positional(
+                simplipy_engine, target_expression, keep_specials=True)
+        except NonFiniteExpressionError:
+            # Minted by OUR tagged simplify call (the producer validated the
+            # prefix form finite), so this is candidate-direction semantics:
+            # drop the instance and count it, like a span-cutting truncation.
+            return {"rejected": "nonfinite"}
+    else:
+        skeleton, literal_values = mask_literals_positional(
+            simplipy_engine, expression)
+    literals = np.asarray(literal_values, dtype=NUMERIC_DTYPE_NP)
+
+    mask_unused_variable_columns(
+        arrays=(x_support,),
+        variables=variables,
+        skeleton_tokens=skeleton,
+        padding=padding,
+    )
+
+    # Drawn BEFORE the task blocks: an unconditioned (condition-dropout) instance
+    # still gets a predict_y block, but pinned to the SUFFIX so the expression is in
+    # scope -- see the placement comment below. The worker rng is entropy-seeded, so
+    # moving this draw ahead of serialization changes no reproducibility contract.
+    condition_mask_value: bool | None = None
+    if unconditional_prob > 0.0:
+        condition_mask_value = draw_condition_mask(worker_rng, unconditional_prob)
+
+    # Promptable-mask machinery. Every decision is PER SLOT over the tagged
+    # canonical's literal sites -- exactly the slots the byte serialization
+    # fills -- so the placeheld values stay recoverable for the
+    # <predict_constants> block.
+    #
+    #   flag 'all'       -> every slot placeheld (deterministic).
+    #   flag 'fittable'  -> simplipy's mask_fittable per slot (deterministic).
+    #   unflagged partial-> per-slot three-way draw (random harness choice).
+    #
+    # The flag is an EMISSION-FORMAT directive: under a flag the placeholder
+    # pattern is policy-determined and the placeholders are supervised; in a
+    # partial instance the pattern is a random draw, so the placeholders are
+    # context-only (loss-masked below). Either half without the other would
+    # train noise or unlearn masked emission.
+    mask_mode: str | None = None
+    partial_instance = False
+    n_slots = len(literals)
+    placeheld: list[bool] = [False] * n_slots
+    if mask_cfg is not None:
+        mask_draw = worker_rng.random()
+        if mask_draw < float(mask_cfg["p_mask_all"]):
+            mask_mode = "all"
+            placeheld = [True] * n_slots
+        elif mask_draw < float(mask_cfg["p_mask_all"]) + float(mask_cfg["p_mask_fittable"]):
+            mask_mode = "fittable"
+            placeheld = fittable_slots(
+                simplipy_engine,
+                target_expression if tagged_targets else expression)
+            assert len(placeheld) == n_slots, "slot alignment broke"
+        elif n_slots > 0 and worker_rng.random() < float(mask_cfg["p_partial"]):
+            partial_instance = True
+            placeheld = [bool(worker_rng.random() < float(mask_cfg["p_placeheld"]))
+                         for _ in range(n_slots)]
+    # Placeholders are positional and naive: each placeheld literal site
+    # becomes a <constant> for the model to predict, and that site's value is
+    # the block's ground truth. A structurally spelled rational contributes one
+    # slot per literal, so `3 / 2` masks to `<constant> / <constant>` and trains
+    # as two predictions.
+    placeheld_values = [float(v) for v, ph in zip(literals, placeheld) if ph]
+
+    if any(placeheld):
+        # Placeholders ARE simplipy's <constant>: the serializer's
+        # None entries keep them, value entries fill the kept slots.
+        constants_opt: list[float | None] = [
+            None if ph else float(v) for v, ph in zip(literals, placeheld)]
+        serialized_tokens, body_numeric = serialize_constant_tokens(
+            skeleton, constants_opt)
+    else:
+        # Raises on non-finite constants: the generator must never emit them.
+        serialized_tokens, body_numeric = serialize_constant_tokens(
+            skeleton, literals)
+    tokens_to_encode = serialized_tokens
+    if has_expression_wrappers:
+        tokens_to_encode = ["<expression>", *tokens_to_encode, "</expression>"]
+        if body_numeric is not None:
+            body_numeric = [float("nan"), *body_numeric, float("nan")]
+
+    history_ids = list(history_ids or [])
+    history_reason = "absent"
+    if history_ids:
+        if condition_mask_value is False:
+            history_ids = []
+            history_reason = "condition_dropout"
+        elif len(tokens_to_encode) + 2 + int(mask_mode is not None) + len(history_ids) > max_seq_len:
+            history_ids = []
+            history_reason = "length"
+        else:
+            max_seq_len -= len(history_ids)
+            history_reason = "included"
+
+    # ---- v24 task blocks ------------------------------------------------------
+    # Attached only within the sequence budget: an over-budget block is SKIPPED
+    # (counted, never silent) rather than dropping the instance, so the blocks
+    # add ZERO truncation pressure -- the expression prior's truncation shaping
+    # stays exactly what it is without the features.
+    complexity_draw: dict[str, Any] | None = None
+    predict_y_draw: dict[str, Any] | None = None
+    residual_draw: dict[str, Any] | None = None
+    task_mask: list[bool] | None = None
+    task_segments: list[int] | None = None
+    block_order: dict[str, list[str]] | None = None
+    predict_constants_draw: dict[str, Any] | None = None
+    if task_blocks_on:
+        budget = max_seq_len - (len(tokens_to_encode) + 2)  # <bos> ... <eos>
+        # Blocks are built as ELEMENTS and assembled at the end (owner
+        # ruling 2026-08-24): truly commutative prefix elements are PERMUTED
+        # per instance so none welds to a position; the hypothesis element is
+        # pinned LAST (from the flag on, the pen is the model's until
+        # <expression>); the two suffix blocks swap 50/50. The drawn order is
+        # recorded in metadata for later splits.
+        # element = (name, tokens, numeric, masked, segments)
+        prefix_elements: list[tuple] = []
+        hypothesis_element: tuple | None = None
+        suffix_elements: list[tuple] = []
+
+        if mask_mode is not None and budget < 1:
+            # No room for even the flag (audit 2026-08-24): emitting the
+            # masked body flag-less would violate flag <=> format, and
+            # letting truncation cut the wrapper emitted broken rows.
+            return {"rejected": "truncation"}
+        if mask_mode is not None:
+            # The emission-format directive: harness-owned, never supervised.
+            prefix_elements.append(("mask_flag", [MASK_MODE_TOKENS[mask_mode]],
+                                    [float("nan")], [True],
+                                    [TASK_SEGMENT_EXPRESSION]))
+            budget -= 1
+
+        complexity_mode = None
+        if complexity_cfg is not None:
+            # Three-way instance draw (priors pinned in the config): hypothesis
+            # mode / prompted block / absent.
+            mode_draw = worker_rng.random()
+            if mode_draw < float(complexity_cfg["p_hypothesize"]):
+                complexity_mode = "hypothesis"
+            elif mode_draw < float(complexity_cfg["p_hypothesize"]) + float(complexity_cfg["p_present"]):
+                complexity_mode = "prompted"
+        if complexity_mode is not None:
+            assert complexity_cfg is not None  # complexity_mode implies the config
+            # mu of the MASKED target (a <constant> prices one symbol unit): the
+            # only complexity a user can state at inference without knowing the
+            # constants. complexity() measures the canonical form, so the target
+            # dialect does not matter. Exact in float64 (mu < 2**53 with room to spare).
+            mu = int(simplipy_engine.complexity(list(skeleton)))
+            if complexity_mode == "hypothesis":
+                # The harness-inserted flag LICENSES self-initiated property
+                # blocks: the flag itself is never supervised (only the harness
+                # may utter it), but everything after it -- opener, format
+                # selector, bytes, closers -- is the model's own hypothesis
+                # and carries loss.
+                # The flag is NOT part of this block: it is the BOUNDARY, emitted
+                # once (below) after every given element. Everything from it to
+                # </expression> is the model's, so the opener carries loss too.
+                block_tokens = [COMPLEXITY_START_TOKEN, IEEE754_START_TOKEN,
+                                *float64_to_byte_tokens(float(mu)),
+                                IEEE754_END_TOKEN, COMPLEXITY_END_TOKEN]
+                block_numeric = [float("nan")] * len(block_tokens)
+                block_masked = [False] * len(block_tokens)
+                variant = "hypothesis"
+            else:
+                # PROMPTED: the caller states the complexity, so it is compact and
+                # entirely harness-owned. The bytes spelling belongs to the
+                # hypothesis circumstance alone (owner ruling 2026-08-27).
+                block_tokens = [COMPLEXITY_START_TOKEN, COMPACT_CONSTANT_TOKEN, COMPLEXITY_END_TOKEN]
+                block_numeric = [float("nan"), float(mu), float("nan")]
+                block_masked = [True, True, True]
+                variant = "float"
+            # +1 for the standalone <hypothesize> boundary this variant needs.
+            need = len(block_tokens) + (1 if variant == "hypothesis" else 0)
+            if need <= budget:
+                budget -= need
+                element = ("complexity", block_tokens, block_numeric, block_masked,
+                           [TASK_SEGMENT_COMPLEXITY] * len(block_tokens))
+                if variant == "hypothesis":
+                    hypothesis_element = element
+                else:
+                    prefix_elements.append(element)
+                complexity_draw = {"mu": mu, "variant": variant}
+            else:
+                n_skipped_task_blocks += 1
+
+        if (predict_y_cfg is not None
+                and x_support.shape[0] >= int(predict_y_cfg["min_n_support"])
+                and worker_rng.random() < float(predict_y_cfg["p_present"])):
+            n_dims = x_support.shape[1]
+            if 4 + n_dims + IEEE754_SPAN_LENGTH <= budget:
+                # Prior-exactness: the held-out point is one of the ALREADY-ACCEPTED
+                # support rows (box acceptance is untouched), never an extra draw;
+                # y* is the CLEAN value -- the task supervises the function, not the
+                # noise. Full precision: no narrowing, no tail zeroing.
+                j = int(worker_rng.integers(x_support.shape[0]))
+                point = x_support[j].astype(NUMERIC_DTYPE_NP)
+                y_star = float(y_support[j].reshape(-1)[0])
+                # Placement decides WHAT the model may condition on:
+                #   suffix (after </expression>) -> the data AND the expression;
+                #   prefix (before <expression>) -> the data alone.
+                # On an UNCONDITIONED instance the encoder memory is nulled, so the
+                # suffix form becomes "evaluate this expression at x*" -- function
+                # evaluation, a well-posed task that grounds the expression tokens
+                # semantically. Only the PREFIX form would be ill-posed there (nulled
+                # memory and no expression = nothing to condition on), so the block is
+                # pinned to the suffix rather than dropped (owner ruling 2026-08-26,
+                # overturning the earlier blanket exclusion).
+                conditional = (
+                    True if condition_mask_value is False
+                    else bool(worker_rng.random() < float(predict_y_cfg["p_conditional"])))
+                x_support = np.delete(x_support, j, axis=0)
+                row_indices = np.delete(row_indices, j)
+                y_support = np.delete(y_support, j, axis=0)
+                y_encoder = np.delete(y_encoder, j, axis=0)
+                if outlier_mask is not None:
+                    outlier_mask = np.delete(outlier_mask, j, axis=0)
+                block_tokens = [PREDICT_Y_START_TOKEN, POINT_START_TOKEN]
+                block_numeric = [float("nan"), float("nan")]
+                block_masked = [True, True]
+                for value in point:
+                    block_tokens.append(COMPACT_CONSTANT_TOKEN)
+                    block_numeric.append(float(value))
+                    block_masked.append(True)
+                block_tokens += [POINT_END_TOKEN, IEEE754_START_TOKEN,
+                                 *float64_to_byte_tokens(y_star),
+                                 IEEE754_END_TOKEN, PREDICT_Y_END_TOKEN]
+                block_numeric += [float("nan")] * (4 + IEEE754_N_BYTES)
+                block_masked += [True, True, *[False] * IEEE754_N_BYTES, False, False]
+                budget -= len(block_tokens)
+                element = ("predict_y", block_tokens, block_numeric, block_masked,
+                           [TASK_SEGMENT_PREDICT_Y] * len(block_tokens))
+                if conditional:
+                    suffix_elements.append(element)
+                else:
+                    prefix_elements.append(element)
+                predict_y_draw = {"x": point.tolist(), "y": y_star, "conditional": conditional}
+            else:
+                n_skipped_task_blocks += 1
+
+        # <predict_constants> (owner rulings 2026-08-24): conditional on >= 1
+        # placeholder, p < 1 in both circumstances so both the plain ending and
+        # the harness-opened continuation stay in-distribution. One span per
+        # placeholder, POSITIONAL order -- the binding needs no indices, and a
+        # fixed constant is simply spelled inline in the expression instead.
+        # Loss discipline as everywhere: openers force-fed, bytes and closing
+        # tags are the model's.
+        if (placeheld_values and mask_cfg is not None
+                and condition_mask_value is not False):
+            # Same doctrine as predict_y (audit 2026-08-24): supervising
+            # constant values against a NULLED memory is a nonsense task.
+            p_block = float(mask_cfg["p_predict_constants_flagged"]
+                            if mask_mode is not None
+                            else mask_cfg["p_predict_constants_partial"])
+            if worker_rng.random() < p_block:
+                need = 2 + len(placeheld_values) * IEEE754_SPAN_LENGTH
+                if need <= budget:
+                    budget -= need
+                    block_tokens = [PREDICT_CONSTANTS_START_TOKEN]
+                    block_numeric = [float("nan")]
+                    block_masked = [True]
+                    for value in placeheld_values:
+                        block_tokens += [IEEE754_START_TOKEN,
+                                         *float64_to_byte_tokens(float(value)),
+                                         IEEE754_END_TOKEN]
+                        block_numeric += [float("nan")] * IEEE754_SPAN_LENGTH
+                        block_masked += [True, *[False] * IEEE754_N_BYTES, False]
+                    block_tokens.append(PREDICT_CONSTANTS_END_TOKEN)
+                    block_numeric.append(float("nan"))
+                    block_masked.append(False)
+                    suffix_elements.append((
+                        "predict_constants", block_tokens, block_numeric, block_masked,
+                        [TASK_SEGMENT_PREDICT_CONSTANTS] * len(block_tokens)))
+                    predict_constants_draw = {"values": list(placeheld_values)}
+                else:
+                    n_skipped_task_blocks += 1
+
+        # <predict_residual>: the displacement between what was OBSERVED at a
+        # point and what the law predicts there. Four things it must NOT copy
+        # from predict_y, each of which silently ruins the task:
+        #
+        #  1. The point is NOT held out. The target is y_observed(x*) - f(x*),
+        #     and y_observed reaches the model only through the encoder. Delete
+        #     the row and the target becomes a single unobserved noise draw
+        #     whose irreducible loss is the noise entropy, forever. Kept in, the
+        #     task is "infer f from the data, report the displacement at a point
+        #     you can observe" -- and that is not a lookup, since retrieving y*
+        #     at a specific x* out of pooled set-encoder memory is real work.
+        #  2. It is DROPPED on an unconditioned instance, never suffix-pinned.
+        #     predict_y survives there because with the expression it degenerates
+        #     to function evaluation, which is well posed. The residual has no
+        #     such fallback: with nulled memory y_observed is unreachable in
+        #     BOTH placements.
+        #  3. It requires a noise mixture. Without one y_encoder IS y_clean, the
+        #     residual is identically 0.0, and the block teaches only "emit eight
+        #     zero bytes".
+        #  4. It picks from what predict_y LEFT. predict_y deletes its row above;
+        #     drawing before that would let the two race for the same point.
+        if (residual_cfg is not None
+                and noise_spec is not None
+                and condition_mask_value is not False
+                and x_support.shape[0] >= int(residual_cfg["min_n_support"])
+                and worker_rng.random() < float(residual_cfg["p_present"])):
+            n_dims = x_support.shape[1]
+            if 4 + n_dims + IEEE754_SPAN_LENGTH <= budget:
+                j = int(worker_rng.integers(x_support.shape[0]))
+                point = x_support[j].astype(NUMERIC_DTYPE_NP)
+                # Differenced in the ENCODER's dtype, so the target is exactly
+                # the displacement present in the data the model sees.
+                residual_value = float(
+                    np.asarray(y_encoder[j], dtype=NUMERIC_DTYPE_NP).reshape(-1)[0]
+                    - np.asarray(y_support[j], dtype=NUMERIC_DTYPE_NP).reshape(-1)[0])
+                if math.isfinite(residual_value):
+                    conditional = bool(worker_rng.random() < float(residual_cfg["p_conditional"]))
+                    block_tokens = [PREDICT_RESIDUAL_START_TOKEN, POINT_START_TOKEN]
+                    block_numeric = [float("nan"), float("nan")]
+                    block_masked = [True, True]
+                    for value in point:
+                        block_tokens.append(COMPACT_CONSTANT_TOKEN)
+                        block_numeric.append(float(value))
+                        block_masked.append(True)
+                    block_tokens += [POINT_END_TOKEN, IEEE754_START_TOKEN,
+                                     *float64_to_byte_tokens(residual_value),
+                                     IEEE754_END_TOKEN, PREDICT_RESIDUAL_END_TOKEN]
+                    block_numeric += [float("nan")] * (4 + IEEE754_N_BYTES)
+                    block_masked += [True, True, *[False] * IEEE754_N_BYTES, False, False]
+                    budget -= len(block_tokens)
+                    element = ("predict_residual", block_tokens, block_numeric, block_masked,
+                               [TASK_SEGMENT_PREDICT_RESIDUAL] * len(block_tokens))
+                    if conditional:
+                        suffix_elements.append(element)
+                    else:
+                        prefix_elements.append(element)
+                    residual_draw = {"x": point.tolist(), "residual": residual_value,
+                                     "conditional": conditional}
+            else:
+                n_skipped_task_blocks += 1
+
+        if len(prefix_elements) > 1:
+            prefix_elements = [prefix_elements[int(k)]
+                               for k in worker_rng.permutation(len(prefix_elements))]
+        if hypothesis_element is not None:
+            # THE BOUNDARY (owner ruling 2026-08-27). Everything before it is
+            # given -- fixed, compact, harness-owned -- and may not recur after
+            # it; everything after it is the model's, spelled in bits. It is a
+            # marker of its own, not part of any block, so it carries no task
+            # segment: with a second hypothesizable property the flag is uttered
+            # ONCE and licenses the whole run that follows.
+            prefix_elements.append(("hypothesize", [HYPOTHESIS_TOKEN], [float("nan")],
+                                    [True], [TASK_SEGMENT_EXPRESSION]))
+            prefix_elements.append(hypothesis_element)
+        if len(suffix_elements) > 1 and worker_rng.random() < 0.5:
+            suffix_elements.reverse()
+        block_order = {"prefix": [e[0] for e in prefix_elements],
+                       "suffix": [e[0] for e in suffix_elements]}
+
+        prefix_tokens = [t for e in prefix_elements for t in e[1]]
+        prefix_numeric = [v for e in prefix_elements for v in e[2]]
+        prefix_masked = [m for e in prefix_elements for m in e[3]]
+        prefix_segments = [g for e in prefix_elements for g in e[4]]
+        suffix_tokens = [t for e in suffix_elements for t in e[1]]
+        suffix_numeric = [v for e in suffix_elements for v in e[2]]
+        suffix_masked = [m for e in suffix_elements for m in e[3]]
+        suffix_segments = [g for e in suffix_elements for g in e[4]]
+
+        if prefix_tokens or suffix_tokens or partial_instance:
+            base_numeric = (body_numeric if body_numeric is not None
+                            else [float("nan")] * len(tokens_to_encode))
+            # Flag-dependent placeholder loss (owner ruling): under a flag the
+            # pattern is policy-determined and the placeholders stay
+            # supervised; in a partial instance they are a random harness
+            # draw the model cannot predict -- context-only, loss-masked.
+            body_masked = ([token == MASKED_CONSTANT_TOKEN for token in tokens_to_encode]
+                           if partial_instance else [False] * len(tokens_to_encode))
+            task_mask = [False, *prefix_masked, *body_masked,
+                         *suffix_masked, False]
+            task_segments = [0, *prefix_segments, *[0] * len(tokens_to_encode),
+                             *suffix_segments, 0]
+            tokens_to_encode = [*prefix_tokens, *tokens_to_encode, *suffix_tokens]
+            body_numeric = [*prefix_numeric, *base_numeric, *suffix_numeric]
+
+    # Numeric channel aligned with the FINAL input_ids ([<bos>, ..., <eos>]): values
+    # only at compact <float> positions; merged downstream by ensure_numeric_channel.
+    input_num = None if body_numeric is None else [float("nan"), *body_numeric, float("nan")]
+
+    body_ids = tokenizer.encode(tokens_to_encode, oov=tokenizer_oov)
+    input_ids = [bos_token_id, *body_ids, eos_token_id]
+    if len(input_ids) > max_seq_len:
+        if strict_length:
+            raise ValueError("target exceeds sequence budget")
+        if truncation_cuts_ieee754_span(
+                input_ids, max_seq_len, ieee754_start_id, ieee754_end_id):
+            # Truncation must never cut inside an <ieee754> span: drop the
+            # instance (like other rejected samples) and count it.
+            return {"rejected": "truncation"}
+        input_ids = input_ids[:max_seq_len]
+        input_ids[-1] = eos_token_id
+        if input_num is not None:
+            input_num = input_num[:max_seq_len]
+            input_num[-1] = float("nan")
+        # The task channels track input_ids (audit 2026-08-24: they were
+        # stored at pre-truncation length and silently clipped downstream).
+        if task_mask is not None:
+            task_mask = task_mask[:max_seq_len]
+            task_mask[-1] = False
+        if task_segments is not None:
+            task_segments = task_segments[:max_seq_len]
+            task_segments[-1] = 0
+
+    metadata: dict[str, Any] = {
+        "skeleton": skeleton,
+        "skeleton_hash": tuple(skeleton),
+        "expression": expression,
+        "n_support": int(x_support.shape[0]),
+    }
+    if isinstance(problem.noise, dict):
+        metadata["noise"] = problem.noise
+    # First-class optional condition (CFG): ONLY when enabled (prob > 0), mark this
+    # example conditioned (True, prob 1 - unconditional_prob) or unconditioned (False).
+    # The key is emitted iff the feature is active, so condition_mask present <=> feature
+    # on -> existing runs (prob 0) are byte-identical and the model never sees a mask.
+    # Flows into the batch via `metadata_fields` (data.py) and routes to `null_memory`
+    # in the model when False. Per-worker RNG is seeded at worker start.
+    if condition_mask_value is not None:
+        metadata["condition_mask"] = condition_mask_value
+
+    # Task-block metadata: keys present <=> feature configured (T0 contract), and
+    # UNIFORM across the batch (the consumer builds columns from entry 0's keys).
+    if task_blocks_on:
+        metadata["task_mask"] = (task_mask if task_mask is not None
+                                 else [False] * len(input_ids))
+        # 0 = expression/other, 1 = complexity, 2 = predict_y, 3 = predict_constants,
+        # 4 = predict_residual: the per-position
+        # channel the trainer splits the CE by (per-task wandb curves).
+        metadata["task_segments"] = (task_segments if task_segments is not None
+                                     else [0] * len(input_ids))
+    if complexity_cfg is not None:
+        metadata["complexity_mu"] = None if complexity_draw is None else complexity_draw["mu"]
+        metadata["complexity_variant"] = None if complexity_draw is None else complexity_draw["variant"]
+    if predict_y_cfg is not None:
+        metadata["predict_y"] = predict_y_draw
+    if residual_cfg is not None:
+        metadata["predict_residual"] = residual_draw
+    if mask_cfg is not None:
+        metadata["mask_mode"] = mask_mode
+        metadata["n_placeholders"] = int(sum(
+            1 for token_id in input_ids if token_id == masked_constant_id))
+        metadata["predict_constants"] = predict_constants_draw
+    if task_blocks_on:
+        metadata["block_order"] = (block_order if block_order is not None
+                                   else {"prefix": [], "suffix": []})
+
+    # Mixed representation only (key present <=> feature on, like condition_mask):
+    # the per-token numeric channel computed during serialization. AUTHORITATIVE:
+    # ensure_numeric_channel passes it through verbatim (audit 2026-08-24 -- a
+    # recompute would put ground-truth values at masked placeholder positions).
+    if input_num is not None:
+        metadata["input_num"] = input_num
+
+    if history_ids:
+        # Keep the format flag directly after BOS, then insert history before all tasks.
+        flag_ids = {tokenizer[t] for t in MASK_MODE_TOKENS.values()}
+        flag_positions = [i for i, token in enumerate(input_ids) if token in flag_ids]
+        if flag_positions:
+            j = flag_positions[0]
+            for channel in (input_ids, metadata.get("input_num"), metadata.get("task_mask"), metadata.get("task_segments")):
+                if channel is not None:
+                    channel.insert(1, channel.pop(j))
+        at = 2 if flag_positions else 1
+        metadata.setdefault("task_mask", [False] * len(input_ids))
+        metadata.setdefault("task_segments", [0] * len(input_ids))
+        metadata.setdefault("input_num", [float("nan")] * len(input_ids))
+        input_ids[at:at] = history_ids
+        for name, value in (("task_mask", True), ("task_segments", 0), ("input_num", float("nan"))):
+            metadata[name][at:at] = [value] * len(history_ids)
+    metadata["history_reason"] = history_reason
+    metadata["history_valid"] = bool(history_ids)
+    return dict(x_support=x_support, y_support=y_support, y_encoder=y_encoder,
+                outlier_mask=outlier_mask, input_ids=input_ids, literals=literals,
+                metadata=metadata, row_indices=row_indices,
+                n_skipped_task_blocks=n_skipped_task_blocks)
+
+
 def _producer_worker(
     work_queue: mp.Queue,
     result_queue: mp.Queue,
@@ -390,43 +933,20 @@ def _producer_worker(
     worker_rng = np.random.default_rng()
 
     tokenizer = worker_config.tokenizer
-    padding = worker_config.padding
     batch_size = worker_config.batch_size
-    tokenizer_oov = worker_config.tokenizer_oov
     worker_preprocess = worker_config.worker_preprocess
-    max_seq_len = worker_config.max_seq_len
     prompt_config = worker_config.preprocessor_prompt_config
-    unconditional_prob = worker_config.unconditional_prob
 
     # Each worker builds its own ProblemSource (and thus its own catalog/engine) from the picklable
     # config, driven by this worker's rng. `catalog` is reused for the preprocessor + variables.
     source = ProblemSource(worker_config.source_config, rng=worker_rng)
     catalog = source.catalog
     simplipy_engine = catalog.simplipy_engine
-    variables = catalog.variables
 
-    masked_constant_id = (int(tokenizer[MASKED_CONSTANT_TOKEN])
-
-                          if MASKED_CONSTANT_TOKEN in tokenizer else -1)
-
-    bos_token_id = tokenizer["<bos>"]
-    eos_token_id = tokenizer["<eos>"]
-    has_expression_wrappers = "<expression>" in tokenizer and "</expression>" in tokenizer
-
-    # ieee754_mixed constants representation: serialize each <constant> occurrence per-constant
-    # as an <ieee754> byte span, or -- for a CALLER-supplied number -- a compact <float> (value on the
-    # numeric channel), driven by this worker's rng.
-    ieee754_start_id = int(tokenizer[IEEE754_START_TOKEN])
-    ieee754_end_id = int(tokenizer[IEEE754_END_TOKEN])
     # Target dialect (contract A3): targets are the engine's TAGGED CANONICAL output,
     # produced by simplify IN the tagged dialect per problem (literals fold canonically, so
     # it cannot be cached per skeleton). 'explicit' (default) keeps today's prefix targets.
     tagged_targets = worker_config.target_dialect == TARGET_DIALECT_TAGGED
-    # The tagged canonicalization runs in the catalog's CONFIGURED target canon
-    # (owner ruling 2026-08-31): a corpus whose prefix targets are permissive-canonical
-    # is permissive-canonical in the tagged dialect too. Catalogs without the knob
-    # (curated pools) resolve to None = the engine's default mode, the historical call.
-    tagged_canon_mode = _tagged_canonical_mode(catalog)
     # Task blocks: <complexity> conditioning/prediction and <predict_y> auxiliary
     # blocks (validated at dataset init: mixed constants + wrapper/block tokens present).
     # The harness owns the grammar; the model owns the content: every opener / format
@@ -502,479 +1022,16 @@ def _producer_worker(
                 if problem.is_placeholder:
                     continue
 
-                x_support = problem.x_support
-                y_support = problem.y_support
-                # The encoder fits what a model would OBSERVE: the noisy targets (identical
-                # to the clean ones whenever the source ran without a noise spec). The clean
-                # y_support stays local for tasks that must not learn the noise.
-                y_encoder = problem.y_support_noisy
-                outlier_mask = problem.outlier_mask_support
-
-                # symbolic-data >= 0.14: generative catalogs yield CONCRETE expressions
-                # (literal values inside the tokens, ``problem.constants`` empty); masking
-                # is downstream policy. Reconstruct the training contract here: the
-                # concrete expression, and the positionally masked skeleton with the
-                # extracted values aligned 1:1 to its '<constant>' placeholders (the
-                # alignment the numeric head trains on). Placeholder-style problems
-                # (curated pools) still substitute their carried constants first, so both
-                # problem shapes take the same path.
-                expression = substitute_constants(
-                    list(problem.skeleton), values=list(problem.constants), inplace=False)
-                if tagged_targets:
-                    # The tagged canonical differs STRUCTURALLY from the prefix canonical
-                    # (rational literal spellings, negative exponents absorbed into pow,
-                    # negation distributed into <sub> sections) -- see
-                    # symbolic_data.token_ops.tagged_canonical. np.pi/np.e stay symbolic
-                    # tokens; every NUMERIC literal is extracted for ieee754 serialization.
-                    try:
-                        target_expression = tagged_canonical(
-                            simplipy_engine, expression, mode=tagged_canon_mode)
-                        skeleton, literal_values = mask_literals_positional(
-                            simplipy_engine, target_expression, keep_specials=True)
-                    except NonFiniteExpressionError:
-                        # Minted by OUR tagged simplify call (the producer validated the
-                        # prefix form finite), so this is candidate-direction semantics:
-                        # drop the instance and count it, like a span-cutting truncation.
+                sample = build_training_sample(problem, worker_config, catalog, worker_rng, noise_spec)
+                if "rejected" in sample:
+                    if sample["rejected"] == "nonfinite":
                         n_dropped_nonfinite += 1
-                        continue
-                else:
-                    skeleton, literal_values = mask_literals_positional(
-                        simplipy_engine, expression)
-                literals = np.asarray(literal_values, dtype=NUMERIC_DTYPE_NP)
-
-                mask_unused_variable_columns(
-                    arrays=(x_support,),
-                    variables=variables,
-                    skeleton_tokens=skeleton,
-                    padding=padding,
-                )
-
-                # Drawn BEFORE the task blocks: an unconditioned (condition-dropout) instance
-                # still gets a predict_y block, but pinned to the SUFFIX so the expression is in
-                # scope -- see the placement comment below. The worker rng is entropy-seeded, so
-                # moving this draw ahead of serialization changes no reproducibility contract.
-                condition_mask_value: bool | None = None
-                if unconditional_prob > 0.0:
-                    condition_mask_value = draw_condition_mask(worker_rng, unconditional_prob)
-
-                # Promptable-mask machinery. Every decision is PER SLOT over the tagged
-                # canonical's literal sites -- exactly the slots the byte serialization
-                # fills -- so the placeheld values stay recoverable for the
-                # <predict_constants> block.
-                #
-                #   flag 'all'       -> every slot placeheld (deterministic).
-                #   flag 'fittable'  -> simplipy's mask_fittable per slot (deterministic).
-                #   unflagged partial-> per-slot three-way draw (random harness choice).
-                #
-                # The flag is an EMISSION-FORMAT directive: under a flag the placeholder
-                # pattern is policy-determined and the placeholders are supervised; in a
-                # partial instance the pattern is a random draw, so the placeholders are
-                # context-only (loss-masked below). Either half without the other would
-                # train noise or unlearn masked emission.
-                mask_mode: str | None = None
-                partial_instance = False
-                n_slots = len(literals)
-                placeheld: list[bool] = [False] * n_slots
-                if mask_cfg is not None:
-                    mask_draw = worker_rng.random()
-                    if mask_draw < float(mask_cfg["p_mask_all"]):
-                        mask_mode = "all"
-                        placeheld = [True] * n_slots
-                    elif mask_draw < float(mask_cfg["p_mask_all"]) + float(mask_cfg["p_mask_fittable"]):
-                        mask_mode = "fittable"
-                        placeheld = fittable_slots(
-                            simplipy_engine,
-                            target_expression if tagged_targets else expression)
-                        assert len(placeheld) == n_slots, "slot alignment broke"
-                    elif n_slots > 0 and worker_rng.random() < float(mask_cfg["p_partial"]):
-                        partial_instance = True
-                        placeheld = [bool(worker_rng.random() < float(mask_cfg["p_placeheld"]))
-                                     for _ in range(n_slots)]
-                # Placeholders are positional and naive: each placeheld literal site
-                # becomes a <constant> for the model to predict, and that site's value is
-                # the block's ground truth. A structurally spelled rational contributes one
-                # slot per literal, so `3 / 2` masks to `<constant> / <constant>` and trains
-                # as two predictions.
-                placeheld_values = [float(v) for v, ph in zip(literals, placeheld) if ph]
-
-                if any(placeheld):
-                    # Placeholders ARE simplipy's <constant>: the serializer's
-                    # None entries keep them, value entries fill the kept slots.
-                    constants_opt: list[float | None] = [
-                        None if ph else float(v) for v, ph in zip(literals, placeheld)]
-                    serialized_tokens, body_numeric = serialize_constant_tokens(
-                        skeleton, constants_opt)
-                else:
-                    # Raises on non-finite constants: the generator must never emit them.
-                    serialized_tokens, body_numeric = serialize_constant_tokens(
-                        skeleton, literals)
-                tokens_to_encode = serialized_tokens
-                if has_expression_wrappers:
-                    tokens_to_encode = ["<expression>", *tokens_to_encode, "</expression>"]
-                    if body_numeric is not None:
-                        body_numeric = [float("nan"), *body_numeric, float("nan")]
-
-                # ---- v24 task blocks ------------------------------------------------------
-                # Attached only within the sequence budget: an over-budget block is SKIPPED
-                # (counted, never silent) rather than dropping the instance, so the blocks
-                # add ZERO truncation pressure -- the expression prior's truncation shaping
-                # stays exactly what it is without the features.
-                complexity_draw: dict[str, Any] | None = None
-                predict_y_draw: dict[str, Any] | None = None
-                residual_draw: dict[str, Any] | None = None
-                task_mask: list[bool] | None = None
-                task_segments: list[int] | None = None
-                block_order: dict[str, list[str]] | None = None
-                predict_constants_draw: dict[str, Any] | None = None
-                if task_blocks_on:
-                    budget = max_seq_len - (len(tokens_to_encode) + 2)  # <bos> ... <eos>
-                    # Blocks are built as ELEMENTS and assembled at the end (owner
-                    # ruling 2026-08-24): truly commutative prefix elements are PERMUTED
-                    # per instance so none welds to a position; the hypothesis element is
-                    # pinned LAST (from the flag on, the pen is the model's until
-                    # <expression>); the two suffix blocks swap 50/50. The drawn order is
-                    # recorded in metadata for later splits.
-                    # element = (name, tokens, numeric, masked, segments)
-                    prefix_elements: list[tuple] = []
-                    hypothesis_element: tuple | None = None
-                    suffix_elements: list[tuple] = []
-
-                    if mask_mode is not None and budget < 1:
-                        # No room for even the flag (audit 2026-08-24): emitting the
-                        # masked body flag-less would violate flag <=> format, and
-                        # letting truncation cut the wrapper emitted broken rows.
+                    else:
                         n_dropped_truncation += 1
-                        continue
-                    if mask_mode is not None:
-                        # The emission-format directive: harness-owned, never supervised.
-                        prefix_elements.append(("mask_flag", [MASK_MODE_TOKENS[mask_mode]],
-                                                [float("nan")], [True],
-                                                [TASK_SEGMENT_EXPRESSION]))
-                        budget -= 1
-
-                    complexity_mode = None
-                    if complexity_cfg is not None:
-                        # Three-way instance draw (priors pinned in the config): hypothesis
-                        # mode / prompted block / absent.
-                        mode_draw = worker_rng.random()
-                        if mode_draw < float(complexity_cfg["p_hypothesize"]):
-                            complexity_mode = "hypothesis"
-                        elif mode_draw < float(complexity_cfg["p_hypothesize"]) + float(complexity_cfg["p_present"]):
-                            complexity_mode = "prompted"
-                    if complexity_mode is not None:
-                        assert complexity_cfg is not None  # complexity_mode implies the config
-                        # mu of the MASKED target (a <constant> prices one symbol unit): the
-                        # only complexity a user can state at inference without knowing the
-                        # constants. complexity() measures the canonical form, so the target
-                        # dialect does not matter. Exact in float64 (mu < 2**53 with room to spare).
-                        mu = int(simplipy_engine.complexity(list(skeleton)))
-                        if complexity_mode == "hypothesis":
-                            # The harness-inserted flag LICENSES self-initiated property
-                            # blocks: the flag itself is never supervised (only the harness
-                            # may utter it), but everything after it -- opener, format
-                            # selector, bytes, closers -- is the model's own hypothesis
-                            # and carries loss.
-                            # The flag is NOT part of this block: it is the BOUNDARY, emitted
-                            # once (below) after every given element. Everything from it to
-                            # </expression> is the model's, so the opener carries loss too.
-                            block_tokens = [COMPLEXITY_START_TOKEN, IEEE754_START_TOKEN,
-                                            *float64_to_byte_tokens(float(mu)),
-                                            IEEE754_END_TOKEN, COMPLEXITY_END_TOKEN]
-                            block_numeric = [float("nan")] * len(block_tokens)
-                            block_masked = [False] * len(block_tokens)
-                            variant = "hypothesis"
-                        else:
-                            # PROMPTED: the caller states the complexity, so it is compact and
-                            # entirely harness-owned. The bytes spelling belongs to the
-                            # hypothesis circumstance alone (owner ruling 2026-08-27).
-                            block_tokens = [COMPLEXITY_START_TOKEN, COMPACT_CONSTANT_TOKEN, COMPLEXITY_END_TOKEN]
-                            block_numeric = [float("nan"), float(mu), float("nan")]
-                            block_masked = [True, True, True]
-                            variant = "float"
-                        # +1 for the standalone <hypothesize> boundary this variant needs.
-                        need = len(block_tokens) + (1 if variant == "hypothesis" else 0)
-                        if need <= budget:
-                            budget -= need
-                            element = ("complexity", block_tokens, block_numeric, block_masked,
-                                       [TASK_SEGMENT_COMPLEXITY] * len(block_tokens))
-                            if variant == "hypothesis":
-                                hypothesis_element = element
-                            else:
-                                prefix_elements.append(element)
-                            complexity_draw = {"mu": mu, "variant": variant}
-                        else:
-                            n_skipped_task_blocks += 1
-
-                    if (predict_y_cfg is not None
-                            and x_support.shape[0] >= int(predict_y_cfg["min_n_support"])
-                            and worker_rng.random() < float(predict_y_cfg["p_present"])):
-                        n_dims = x_support.shape[1]
-                        if 4 + n_dims + IEEE754_SPAN_LENGTH <= budget:
-                            # Prior-exactness: the held-out point is one of the ALREADY-ACCEPTED
-                            # support rows (box acceptance is untouched), never an extra draw;
-                            # y* is the CLEAN value -- the task supervises the function, not the
-                            # noise. Full precision: no narrowing, no tail zeroing.
-                            j = int(worker_rng.integers(x_support.shape[0]))
-                            point = x_support[j].astype(NUMERIC_DTYPE_NP)
-                            y_star = float(y_support[j].reshape(-1)[0])
-                            # Placement decides WHAT the model may condition on:
-                            #   suffix (after </expression>) -> the data AND the expression;
-                            #   prefix (before <expression>) -> the data alone.
-                            # On an UNCONDITIONED instance the encoder memory is nulled, so the
-                            # suffix form becomes "evaluate this expression at x*" -- function
-                            # evaluation, a well-posed task that grounds the expression tokens
-                            # semantically. Only the PREFIX form would be ill-posed there (nulled
-                            # memory and no expression = nothing to condition on), so the block is
-                            # pinned to the suffix rather than dropped (owner ruling 2026-08-26,
-                            # overturning the earlier blanket exclusion).
-                            conditional = (
-                                True if condition_mask_value is False
-                                else bool(worker_rng.random() < float(predict_y_cfg["p_conditional"])))
-                            x_support = np.delete(x_support, j, axis=0)
-                            y_support = np.delete(y_support, j, axis=0)
-                            y_encoder = np.delete(y_encoder, j, axis=0)
-                            if outlier_mask is not None:
-                                outlier_mask = np.delete(outlier_mask, j, axis=0)
-                            block_tokens = [PREDICT_Y_START_TOKEN, POINT_START_TOKEN]
-                            block_numeric = [float("nan"), float("nan")]
-                            block_masked = [True, True]
-                            for value in point:
-                                block_tokens.append(COMPACT_CONSTANT_TOKEN)
-                                block_numeric.append(float(value))
-                                block_masked.append(True)
-                            block_tokens += [POINT_END_TOKEN, IEEE754_START_TOKEN,
-                                             *float64_to_byte_tokens(y_star),
-                                             IEEE754_END_TOKEN, PREDICT_Y_END_TOKEN]
-                            block_numeric += [float("nan")] * (4 + IEEE754_N_BYTES)
-                            block_masked += [True, True, *[False] * IEEE754_N_BYTES, False, False]
-                            budget -= len(block_tokens)
-                            element = ("predict_y", block_tokens, block_numeric, block_masked,
-                                       [TASK_SEGMENT_PREDICT_Y] * len(block_tokens))
-                            if conditional:
-                                suffix_elements.append(element)
-                            else:
-                                prefix_elements.append(element)
-                            predict_y_draw = {"x": point.tolist(), "y": y_star, "conditional": conditional}
-                        else:
-                            n_skipped_task_blocks += 1
-
-                    # <predict_constants> (owner rulings 2026-08-24): conditional on >= 1
-                    # placeholder, p < 1 in both circumstances so both the plain ending and
-                    # the harness-opened continuation stay in-distribution. One span per
-                    # placeholder, POSITIONAL order -- the binding needs no indices, and a
-                    # fixed constant is simply spelled inline in the expression instead.
-                    # Loss discipline as everywhere: openers force-fed, bytes and closing
-                    # tags are the model's.
-                    if (placeheld_values and mask_cfg is not None
-                            and condition_mask_value is not False):
-                        # Same doctrine as predict_y (audit 2026-08-24): supervising
-                        # constant values against a NULLED memory is a nonsense task.
-                        p_block = float(mask_cfg["p_predict_constants_flagged"]
-                                        if mask_mode is not None
-                                        else mask_cfg["p_predict_constants_partial"])
-                        if worker_rng.random() < p_block:
-                            need = 2 + len(placeheld_values) * IEEE754_SPAN_LENGTH
-                            if need <= budget:
-                                budget -= need
-                                block_tokens = [PREDICT_CONSTANTS_START_TOKEN]
-                                block_numeric = [float("nan")]
-                                block_masked = [True]
-                                for value in placeheld_values:
-                                    block_tokens += [IEEE754_START_TOKEN,
-                                                     *float64_to_byte_tokens(float(value)),
-                                                     IEEE754_END_TOKEN]
-                                    block_numeric += [float("nan")] * IEEE754_SPAN_LENGTH
-                                    block_masked += [True, *[False] * IEEE754_N_BYTES, False]
-                                block_tokens.append(PREDICT_CONSTANTS_END_TOKEN)
-                                block_numeric.append(float("nan"))
-                                block_masked.append(False)
-                                suffix_elements.append((
-                                    "predict_constants", block_tokens, block_numeric, block_masked,
-                                    [TASK_SEGMENT_PREDICT_CONSTANTS] * len(block_tokens)))
-                                predict_constants_draw = {"values": list(placeheld_values)}
-                            else:
-                                n_skipped_task_blocks += 1
-
-                    # <predict_residual>: the displacement between what was OBSERVED at a
-                    # point and what the law predicts there. Four things it must NOT copy
-                    # from predict_y, each of which silently ruins the task:
-                    #
-                    #  1. The point is NOT held out. The target is y_observed(x*) - f(x*),
-                    #     and y_observed reaches the model only through the encoder. Delete
-                    #     the row and the target becomes a single unobserved noise draw
-                    #     whose irreducible loss is the noise entropy, forever. Kept in, the
-                    #     task is "infer f from the data, report the displacement at a point
-                    #     you can observe" -- and that is not a lookup, since retrieving y*
-                    #     at a specific x* out of pooled set-encoder memory is real work.
-                    #  2. It is DROPPED on an unconditioned instance, never suffix-pinned.
-                    #     predict_y survives there because with the expression it degenerates
-                    #     to function evaluation, which is well posed. The residual has no
-                    #     such fallback: with nulled memory y_observed is unreachable in
-                    #     BOTH placements.
-                    #  3. It requires a noise mixture. Without one y_encoder IS y_clean, the
-                    #     residual is identically 0.0, and the block teaches only "emit eight
-                    #     zero bytes".
-                    #  4. It picks from what predict_y LEFT. predict_y deletes its row above;
-                    #     drawing before that would let the two race for the same point.
-                    if (residual_cfg is not None
-                            and noise_spec is not None
-                            and condition_mask_value is not False
-                            and x_support.shape[0] >= int(residual_cfg["min_n_support"])
-                            and worker_rng.random() < float(residual_cfg["p_present"])):
-                        n_dims = x_support.shape[1]
-                        if 4 + n_dims + IEEE754_SPAN_LENGTH <= budget:
-                            j = int(worker_rng.integers(x_support.shape[0]))
-                            point = x_support[j].astype(NUMERIC_DTYPE_NP)
-                            # Differenced in the ENCODER's dtype, so the target is exactly
-                            # the displacement present in the data the model sees.
-                            residual_value = float(
-                                np.asarray(y_encoder[j], dtype=NUMERIC_DTYPE_NP).reshape(-1)[0]
-                                - np.asarray(y_support[j], dtype=NUMERIC_DTYPE_NP).reshape(-1)[0])
-                            if math.isfinite(residual_value):
-                                conditional = bool(worker_rng.random() < float(residual_cfg["p_conditional"]))
-                                block_tokens = [PREDICT_RESIDUAL_START_TOKEN, POINT_START_TOKEN]
-                                block_numeric = [float("nan"), float("nan")]
-                                block_masked = [True, True]
-                                for value in point:
-                                    block_tokens.append(COMPACT_CONSTANT_TOKEN)
-                                    block_numeric.append(float(value))
-                                    block_masked.append(True)
-                                block_tokens += [POINT_END_TOKEN, IEEE754_START_TOKEN,
-                                                 *float64_to_byte_tokens(residual_value),
-                                                 IEEE754_END_TOKEN, PREDICT_RESIDUAL_END_TOKEN]
-                                block_numeric += [float("nan")] * (4 + IEEE754_N_BYTES)
-                                block_masked += [True, True, *[False] * IEEE754_N_BYTES, False, False]
-                                budget -= len(block_tokens)
-                                element = ("predict_residual", block_tokens, block_numeric, block_masked,
-                                           [TASK_SEGMENT_PREDICT_RESIDUAL] * len(block_tokens))
-                                if conditional:
-                                    suffix_elements.append(element)
-                                else:
-                                    prefix_elements.append(element)
-                                residual_draw = {"x": point.tolist(), "residual": residual_value,
-                                                 "conditional": conditional}
-                        else:
-                            n_skipped_task_blocks += 1
-
-                    if len(prefix_elements) > 1:
-                        prefix_elements = [prefix_elements[int(k)]
-                                           for k in worker_rng.permutation(len(prefix_elements))]
-                    if hypothesis_element is not None:
-                        # THE BOUNDARY (owner ruling 2026-08-27). Everything before it is
-                        # given -- fixed, compact, harness-owned -- and may not recur after
-                        # it; everything after it is the model's, spelled in bits. It is a
-                        # marker of its own, not part of any block, so it carries no task
-                        # segment: with a second hypothesizable property the flag is uttered
-                        # ONCE and licenses the whole run that follows.
-                        prefix_elements.append(("hypothesize", [HYPOTHESIS_TOKEN], [float("nan")],
-                                                [True], [TASK_SEGMENT_EXPRESSION]))
-                        prefix_elements.append(hypothesis_element)
-                    if len(suffix_elements) > 1 and worker_rng.random() < 0.5:
-                        suffix_elements.reverse()
-                    block_order = {"prefix": [e[0] for e in prefix_elements],
-                                   "suffix": [e[0] for e in suffix_elements]}
-
-                    prefix_tokens = [t for e in prefix_elements for t in e[1]]
-                    prefix_numeric = [v for e in prefix_elements for v in e[2]]
-                    prefix_masked = [m for e in prefix_elements for m in e[3]]
-                    prefix_segments = [g for e in prefix_elements for g in e[4]]
-                    suffix_tokens = [t for e in suffix_elements for t in e[1]]
-                    suffix_numeric = [v for e in suffix_elements for v in e[2]]
-                    suffix_masked = [m for e in suffix_elements for m in e[3]]
-                    suffix_segments = [g for e in suffix_elements for g in e[4]]
-
-                    if prefix_tokens or suffix_tokens or partial_instance:
-                        base_numeric = (body_numeric if body_numeric is not None
-                                        else [float("nan")] * len(tokens_to_encode))
-                        # Flag-dependent placeholder loss (owner ruling): under a flag the
-                        # pattern is policy-determined and the placeholders stay
-                        # supervised; in a partial instance they are a random harness
-                        # draw the model cannot predict -- context-only, loss-masked.
-                        body_masked = ([token == MASKED_CONSTANT_TOKEN for token in tokens_to_encode]
-                                       if partial_instance else [False] * len(tokens_to_encode))
-                        task_mask = [False, *prefix_masked, *body_masked,
-                                     *suffix_masked, False]
-                        task_segments = [0, *prefix_segments, *[0] * len(tokens_to_encode),
-                                         *suffix_segments, 0]
-                        tokens_to_encode = [*prefix_tokens, *tokens_to_encode, *suffix_tokens]
-                        body_numeric = [*prefix_numeric, *base_numeric, *suffix_numeric]
-
-                # Numeric channel aligned with the FINAL input_ids ([<bos>, ..., <eos>]): values
-                # only at compact <float> positions; merged downstream by ensure_numeric_channel.
-                input_num = None if body_numeric is None else [float("nan"), *body_numeric, float("nan")]
-
-                body_ids = tokenizer.encode(tokens_to_encode, oov=tokenizer_oov)
-                input_ids = [bos_token_id, *body_ids, eos_token_id]
-                if len(input_ids) > max_seq_len:
-                    if truncation_cuts_ieee754_span(
-                            input_ids, max_seq_len, ieee754_start_id, ieee754_end_id):
-                        # Truncation must never cut inside an <ieee754> span: drop the
-                        # instance (like other rejected samples) and count it.
-                        n_dropped_truncation += 1
-                        continue
-                    input_ids = input_ids[:max_seq_len]
-                    input_ids[-1] = eos_token_id
-                    if input_num is not None:
-                        input_num = input_num[:max_seq_len]
-                        input_num[-1] = float("nan")
-                    # The task channels track input_ids (audit 2026-08-24: they were
-                    # stored at pre-truncation length and silently clipped downstream).
-                    if task_mask is not None:
-                        task_mask = task_mask[:max_seq_len]
-                        task_mask[-1] = False
-                    if task_segments is not None:
-                        task_segments = task_segments[:max_seq_len]
-                        task_segments[-1] = 0
-
-                metadata = {
-                    "skeleton": skeleton,
-                    "skeleton_hash": tuple(skeleton),
-                    "expression": expression,
-                    "n_support": int(x_support.shape[0]),
-                }
-                if isinstance(problem.noise, dict):
-                    metadata["noise"] = problem.noise
-                # First-class optional condition (CFG): ONLY when enabled (prob > 0), mark this
-                # example conditioned (True, prob 1 - unconditional_prob) or unconditioned (False).
-                # The key is emitted iff the feature is active, so condition_mask present <=> feature
-                # on -> existing runs (prob 0) are byte-identical and the model never sees a mask.
-                # Flows into the batch via `metadata_fields` (data.py) and routes to `null_memory`
-                # in the model when False. Per-worker RNG is seeded at worker start.
-                if condition_mask_value is not None:
-                    metadata["condition_mask"] = condition_mask_value
-
-                # Task-block metadata: keys present <=> feature configured (T0 contract), and
-                # UNIFORM across the batch (the consumer builds columns from entry 0's keys).
-                if task_blocks_on:
-                    metadata["task_mask"] = (task_mask if task_mask is not None
-                                             else [False] * len(input_ids))
-                    # 0 = expression/other, 1 = complexity, 2 = predict_y, 3 = predict_constants,
-                    # 4 = predict_residual: the per-position
-                    # channel the trainer splits the CE by (per-task wandb curves).
-                    metadata["task_segments"] = (task_segments if task_segments is not None
-                                                 else [0] * len(input_ids))
-                if complexity_cfg is not None:
-                    metadata["complexity_mu"] = None if complexity_draw is None else complexity_draw["mu"]
-                    metadata["complexity_variant"] = None if complexity_draw is None else complexity_draw["variant"]
-                if predict_y_cfg is not None:
-                    metadata["predict_y"] = predict_y_draw
-                if residual_cfg is not None:
-                    metadata["predict_residual"] = residual_draw
-                if mask_cfg is not None:
-                    metadata["mask_mode"] = mask_mode
-                    metadata["n_placeholders"] = int(sum(
-                        1 for token_id in input_ids if token_id == masked_constant_id))
-                    metadata["predict_constants"] = predict_constants_draw
-                if task_blocks_on:
-                    metadata["block_order"] = (block_order if block_order is not None
-                                               else {"prefix": [], "suffix": []})
-
-                # Mixed representation only (key present <=> feature on, like condition_mask):
-                # the per-token numeric channel computed during serialization. AUTHORITATIVE:
-                # ensure_numeric_channel passes it through verbatim (audit 2026-08-24 -- a
-                # recompute would put ground-truth values at masked placeholder positions).
-                if input_num is not None:
-                    metadata["input_num"] = input_num
+                    continue
+                x_support, y_support, y_encoder = (sample[k] for k in ("x_support", "y_support", "y_encoder"))
+                outlier_mask, input_ids, literals, metadata = (sample[k] for k in ("outlier_mask", "input_ids", "literals", "metadata"))
+                n_skipped_task_blocks += sample["n_skipped_task_blocks"]
 
                 x_tensors_batch[i, : x_support.shape[0], : x_support.shape[1]] = x_support
                 x_tensors_batch[i, x_support.shape[0]:, :] = 0

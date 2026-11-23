@@ -1,0 +1,52 @@
+# Tiny smoke version of config.yaml (whole pipeline in minutes; numbers mean nothing).
+version: 1
+model: models/psaegert/flash-ansr-v25.0-T8-3M
+recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
+train_recipe: configs/v25.0-T8.1-3M/train.yaml
+output: runs/history_benefits/r3_near_correct_history_smoke
+wandb_group: r3_near_correct_history_smoke   # W&B group; run names get the "r3" prefix
+# Problems 0..999, the 200 validation problems, their model pools and step-0 are linked from here
+# (same seeds, so the same problems; the link stage re-draws and compares them).
+reuse: runs/history_benefits/r2_random_vs_model_history
+reuse_train_problems: 1000
+# seed: the shared step-0 initialization only; every other stream has its own seed below.
+seed: 20261120
+data_seed_train: 20261121
+data_seed_validation: 20261122
+train_seed: 20261123
+fit_seed: 20261124
+eval_seed: 20261125
+data_seed_fresh: 20261126       # on-the-fly training problems (none / near samples)
+data_seed_selection: 20261127   # checkpoint-selection problems (ids 200000..), never evaluated
+threads: 4
+workers: 4
+train_problems: 1006
+validation_problems: 4
+selection_problems: 4
+draws: 5
+restarts: 8
+keep: null
+history_top: 10
+max_length: 256
+generation_tokens: 128
+batch_size: 16
+micro_batch: 8
+steps: 20
+warmup: 2
+cooldown_from: 16
+checkpoint_every: 10
+# sample kinds per batch (fractions); see r3_samples.py
+mix:
+  A: {none: 1.0}
+  C: {none: 0.3, near: 0.4, real: 0.3}
+# levels of the near-correct histories (corrupt.py)
+near_levels: {exact: 0.1, constants: 0.3, structure_1: 0.4, structure_2_3: 0.2}
+phase0_draws: 5
+phase1_draws: 5
+baseline_draws: 10
+diagnose_problems: 2
+diagnose_draws: 5
+validation_sampling:
+  n_support: 512
+  n_validation: 512
+  noise: 0.0

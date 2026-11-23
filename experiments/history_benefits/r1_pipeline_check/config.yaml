@@ -1,0 +1,22 @@
+# Round 1 (r1_pipeline_check): 200 problems, A/B/C 100 steps each -- does the pipeline run end to end?
+version: 1
+model: models/psaegert/flash-ansr-v25.0-T8-3M
+recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
+train_recipe: configs/v25.0-T8.1-3M/train.yaml
+output: runs/history_benefits/r1_pipeline_check
+seed: 20261120
+threads: 4
+workers: 4
+problems: 200
+train_problems: 160
+draws: 300
+restarts: 8
+keep: 16
+history_top: 10
+max_length: 256
+generation_tokens: 128
+evaluation_draws: 20
+batch_size: 128
+micro_batch: 8
+small_steps: 20
+pilot_steps: 100

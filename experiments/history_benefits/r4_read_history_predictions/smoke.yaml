@@ -1,0 +1,57 @@
+# Tiny smoke version of config.yaml (whole pipeline in minutes; numbers mean nothing).
+# Groups I and IC, 1,000 steps each from a step-0 whose history-column input weights are
+# re-drawn; judged by the input ablation at step 1,000 against round-3 C's step 1,000
+# (experiment-results/history_benefits/r4_read_history_predictions/设计与预注册.md §14).
+version: 1
+model: models/psaegert/flash-ansr-v25.0-T8-3M
+recipe: configs/v25.0-T8.1-3M/dataset_train.yaml
+train_recipe: configs/v25.0-T8.1-3M/train.yaml
+output: runs/history_benefits/r4_read_history_predictions_smoke
+wandb_group: r4_read_history_predictions_smoke   # W&B group; run names get the "r4" prefix
+# problems, model pools and step-0 come from round 3 (hard links; step-0 is then changed)
+reuse: runs/history_benefits/r3_near_correct_history_smoke
+# seeds: all as round 3 (the link stage checks), so fresh problems and batches repeat round 3's
+seed: 20261120
+data_seed_train: 20261121
+data_seed_validation: 20261122
+train_seed: 20261123
+fit_seed: 20261124
+eval_seed: 20261125
+data_seed_fresh: 20261126
+data_seed_selection: 20261127
+history_init_seed: 20261128      # the re-drawn history-column weights
+threads: 4
+workers: 4
+train_problems: 1006
+validation_problems: 4
+selection_problems: 4          # the evaluation set of this round (ids 200000..)
+draws: 5
+restarts: 8
+keep: null
+history_top: 10
+max_length: 256
+generation_tokens: 128
+batch_size: 16
+micro_batch: 8
+steps: 20
+warmup: 2
+cooldown_from: 20              # no decay: same learning-rate history as round-3 C's first 1,000 steps
+checkpoint_every: 10
+mix:
+  I: {none: 0.3, near: 0.4, real: 0.3}
+  IC: {none: 0.3, near: 0.4, real: 0.3}
+near_mode:
+  I: levels                      # round 3's construction (near_levels below)
+  IC: fvu_bins                   # aimed at FVU bins drawn uniformly
+near_levels: {exact: 0.1, constants: 0.3, structure_1: 0.4, structure_2_3: 0.2}
+fvu_edges: [1.0e-3, 0.1]
+near_exact_in_low: 0.5           # IC: share of the exact formula in the lowest bin
+near_constant_scale: [0.001, 0.5]  # IC: constants x (1 ± d), d log-uniform on this range
+compare_step: 20
+compare_reference: runs/history_benefits/r3_near_correct_history_smoke/train/C/checkpoint_10.pt
+copy_probe_problems: 4
+link_check_problems: 4
+validation_sampling:
+  n_support: 512
+  n_validation: 512
+  noise: 0.0

@@ -144,6 +144,7 @@ class FlashANSRModel(nn.Module):
 
         decoder_data_mode: str = "cross_attention",
         decoder_data_norm: str = "rms",
+        history_slots: int = 0,
     ) -> None:
         super().__init__()
 
@@ -157,6 +158,9 @@ class FlashANSRModel(nn.Module):
 
         self.simplipy_engine = simplipy_engine
         self.tokenizer = tokenizer
+        if history_slots not in (0, 1):
+            raise ValueError("history_slots must be 0 or 1")
+        self.history_slots = history_slots
         self.encoder_max_n_variables = encoder_max_n_variables
         # Zero the numeric-token embedding inputs at positions whose input_num is NaN (i.e. no
         # numeric payload). NaN must be detected on the RAW values: the IEEE-754 bit pre-encoder
@@ -173,7 +177,7 @@ class FlashANSRModel(nn.Module):
         self.pre_encoder_bits = pre_encoder_bits
 
         self.pre_encoder = IEEE754PreEncoder(
-            input_size=encoder_max_n_variables, bits=pre_encoder_bits)
+            input_size=encoder_max_n_variables + history_slots, bits=pre_encoder_bits)
 
         self.pre_encoder_numeric_tokens = IEEE754PreEncoder(input_size=1, bits=pre_encoder_bits)
         self.pre_encoder_noise_scale = pre_encoder_noise_scale
@@ -533,6 +537,7 @@ class FlashANSRModel(nn.Module):
             encoder_mask_query_norms=config_.get("encoder_mask_query_norms", False),
             sanitize_input_num=config_.get("sanitize_input_num", False),
 
+            history_slots=config_.get("history_slots", 0),
             decoder_data_mode=data_mode,
             decoder_data_norm=config_.get("decoder_data_norm", "rms"),
         )
@@ -551,9 +556,20 @@ class FlashANSRModel(nn.Module):
         with torch.autocast(device_type=decoder_output.device.type, enabled=False):
             return self.next_token_head(decoder_output.to(weight_dtype))
 
-    def _create_memory(self, data: torch.Tensor, data_attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def _create_memory(self, data: torch.Tensor, data_attn_mask: torch.Tensor | None = None, history_mask: torch.Tensor | None = None) -> torch.Tensor:
         if data.ndim != 3:
             data = data.unsqueeze(0)
+
+        # History is optional; an absent slot is zero in FEATURE space, not the
+        # IEEE encoding of zero. A real zero prediction remains a valid bit pattern.
+        if self.history_slots:
+            if data.shape[-1] == self.encoder_max_n_variables:
+                data = torch.cat((data, torch.zeros_like(data[..., :1])), dim=-1)
+                history_mask = torch.zeros(data.shape[0], dtype=torch.bool, device=data.device)
+            elif history_mask is None:
+                raise ValueError("An explicit history_mask is required for history columns")
+        elif history_mask is not None:
+            raise ValueError("history_mask requires history_slots=1")
 
         # Pre-process input data
         data_pre_encodings: torch.Tensor = self.pre_encoder(data)
@@ -561,7 +577,7 @@ class FlashANSRModel(nn.Module):
         # Read-and-trust was how a scrambled pre-encoding stayed invisible: D and E come off the
         # tensor, so a pre-encoder whose width disagrees with this model's is absorbed silently.
         # Check them against what this model was BUILT for.
-        if D != self.encoder_max_n_variables or E != self.pre_encoder.encoding_size:
+        if D != self.encoder_max_n_variables + self.history_slots or E != self.pre_encoder.encoding_size:
             raise ValueError(
                 f"pre-encoding shape (D={D}, E={E}) disagrees with the model "
                 f"(encoder_max_n_variables={self.encoder_max_n_variables}, "
@@ -572,6 +588,16 @@ class FlashANSRModel(nn.Module):
         if self.training:
             noise = torch.randn_like(data_pre_encodings) * self.pre_encoder_noise_scale
             data_pre_encodings = data_pre_encodings + noise
+
+        if self.history_slots:
+            assert history_mask is not None
+            valid = history_mask.to(device=data.device, dtype=torch.bool).reshape(B, 1, 1)
+            data_pre_encodings = torch.cat(
+                (data_pre_encodings[..., :-1, :],
+                 torch.where(valid.unsqueeze(-1), data_pre_encodings[..., -1:, :],
+                             torch.zeros_like(data_pre_encodings[..., -1:, :]))),
+                dim=-2,
+            )
 
         # Encoder forward pass; with the outlier head enabled, the per-point (pre-pooling)
         # representations are captured from the SAME pass -- no recompute.
@@ -587,7 +613,7 @@ class FlashANSRModel(nn.Module):
 
         return memory
 
-    def forward(self, input_tokens: torch.Tensor, data: torch.Tensor | None, input_num: torch.Tensor | None = None, memory: torch.Tensor | None = None, data_attn_mask: torch.Tensor | None = None, condition_mask: torch.Tensor | None = None, past_key_values: list | None = None, use_cache: bool = False) -> torch.Tensor | tuple[torch.Tensor, list]:
+    def forward(self, input_tokens: torch.Tensor, data: torch.Tensor | None, input_num: torch.Tensor | None = None, memory: torch.Tensor | None = None, data_attn_mask: torch.Tensor | None = None, condition_mask: torch.Tensor | None = None, past_key_values: list | None = None, use_cache: bool = False, history_mask: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, list]:
         """Compute next-token logits for ``input_tokens`` conditioned on the ``(X, y)`` support set.
 
         Encoder memory is taken from ``memory`` if given, otherwise built from ``data`` (or reused
@@ -628,7 +654,7 @@ class FlashANSRModel(nn.Module):
             # on `null_memory` directly, never this assignment).
             self.memory = memory.detach() if isinstance(memory, nn.Parameter) else memory
         elif data is not None:
-            self.memory = self._create_memory(data, data_attn_mask)
+            self.memory = self._create_memory(data, data_attn_mask, history_mask)
         elif self.memory is None:
             raise ValueError("Either `data` or `memory` must be provided for the first forward pass.")
 
